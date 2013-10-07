@@ -1269,11 +1269,6 @@ builtin_intern(PyObject *self, PyObject *args)
                         "can't intern subclass of string");
         return NULL;
     }
-    if (((PyStringObject *)s)->ob_merits != NULL) {
-        PyErr_SetString(PyExc_TypeError,
-                        "tainted strings can't be interned");
-        return NULL;
-    }
     Py_INCREF(s);
     PyString_InternInPlace(&s);
     return s;
@@ -2720,7 +2715,6 @@ _PyBuiltin_Init(void)
     SETBUILTIN("int",                   &PyInt_Type);
     SETBUILTIN("list",                  &PyList_Type);
     SETBUILTIN("long",                  &PyLong_Type);
-    SETBUILTIN("Merit",                 &PyMerit_MeritType);
     SETBUILTIN("object",                &PyBaseObject_Type);
     SETBUILTIN("reversed",              &PyReversed_Type);
     SETBUILTIN("set",                   &PySet_Type);

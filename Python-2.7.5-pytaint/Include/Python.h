@@ -117,9 +117,6 @@
 #include "warnings.h"
 #include "weakrefobject.h"
 
-#include "taintobject.h"
-#include "meritobject.h"
-
 #include "codecs.h"
 #include "pyerrors.h"
 

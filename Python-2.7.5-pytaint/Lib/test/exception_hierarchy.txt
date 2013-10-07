@@ -32,7 +32,6 @@ BaseException
       |    |    +-- IndentationError
       |    |         +-- TabError
       |    +-- SystemError
-      |    +-- TaintError
       |    +-- TypeError
       |    +-- ValueError
       |         +-- UnicodeError

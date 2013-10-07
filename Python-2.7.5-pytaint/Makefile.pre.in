@@ -370,7 +370,6 @@ OBJECT_OBJS=	\
 		Objects/longobject.o \
 		Objects/dictobject.o \
 		Objects/memoryobject.o \
-		Objects/meritobject.o \
 		Objects/methodobject.o \
 		Objects/moduleobject.o \
 		Objects/object.o \
@@ -380,7 +379,6 @@ OBJECT_OBJS=	\
 		Objects/sliceobject.o \
 		Objects/stringobject.o \
 		Objects/structseq.o \
-		Objects/taintobject.o \
 		Objects/tupleobject.o \
 		Objects/typeobject.o \
 		Objects/weakrefobject.o \

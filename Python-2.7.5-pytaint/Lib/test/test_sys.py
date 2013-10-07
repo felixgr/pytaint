@@ -704,8 +704,8 @@ class SizeofTest(unittest.TestCase):
         check(slice(1), size('3P'))
         # str
         vh = test.test_support._vheader
-        check('', struct.calcsize(vh + 'Plic'))
-        check('abc', struct.calcsize(vh + 'Plic') + 3)
+        check('', struct.calcsize(vh + 'lic'))
+        check('abc', struct.calcsize(vh + 'lic') + 3)
         # super
         check(super(int), size('3P'))
         # tuple
@@ -731,7 +731,7 @@ class SizeofTest(unittest.TestCase):
         # we need to test for both sizes, because we don't know if the string
         # has been cached
         for s in samples:
-            check(s, size('PPPlP') + usize * (len(s) + 1))
+            check(s, size('PPlP') + usize * (len(s) + 1))
         # weakref
         import weakref
         check(weakref.ref(int), size('2Pl2P'))
