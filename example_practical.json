@@ -1,0 +1,21 @@
+{
+  "cleaners": [
+    {"merit": "ShellMerit"},
+     "pipes.quote"],
+  "sinks": [
+    {"merit": "HtmlMerit"},
+     "Handler.send_response",
+    {"merit": "SecretMerit"},
+     "Handler.send_response",
+    {"merit": "PickleMerit"},
+     "pickle.loads",
+    {"merit": "ShellMerit"},
+     "commands.getoutput"
+     ],
+  "sources": [
+     "Handler.get_parameters"
+    ],
+  "propagators": [
+     "hashlib.md5"
+    ]
+}
