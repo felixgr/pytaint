@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 #include <stdarg.h>
+#include "taintobject.h"
 
 /*
 Type PyStringObject represents a character string.  An extra zero byte is
@@ -34,6 +35,7 @@ functions should be applied to nil objects.
 
 typedef struct {
     PyObject_VAR_HEAD
+    PyTaintObject *ob_merits;
     long ob_shash;
     int ob_sstate;
     char ob_sval[1];
@@ -45,6 +47,8 @@ typedef struct {
      *     ob_sstate != 0 iff the string object is in stringobject.c's
      *       'interned' dictionary; in this case the two references
      *       from 'interned' to this object are *not counted* in ob_refcnt.
+     *     ob_merits is NULL for untainted strings, otherwise it is a tuple of
+     *       string's merits
      */
 } PyStringObject;
 
@@ -75,7 +79,7 @@ PyAPI_FUNC(int) _PyString_Eq(PyObject *, PyObject*);
 PyAPI_FUNC(PyObject *) PyString_Format(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) _PyString_FormatLong(PyObject*, int, int,
 						  int, char**, int*);
-PyAPI_FUNC(PyObject *) PyString_DecodeEscape(const char *, Py_ssize_t, 
+PyAPI_FUNC(PyObject *) PyString_DecodeEscape(const char *, Py_ssize_t,
 						   const char *, Py_ssize_t,
 						   const char *);
 
@@ -84,12 +88,45 @@ PyAPI_FUNC(void) PyString_InternImmortal(PyObject **);
 PyAPI_FUNC(PyObject *) PyString_InternFromString(const char *);
 PyAPI_FUNC(void) _Py_ReleaseInternedStrings(void);
 
+PyAPI_FUNC(PyObject *)
+PyString_FromStringAndSizeSameMerits(const char *, Py_ssize_t,
+                                     PyTaintObject *);
+PyAPI_FUNC(PyObject *) PyString_FromStringAndSizeNoIntern(const char *,
+                                                          Py_ssize_t);
+PyAPI_FUNC(int) _PyString_BinaryTaintPropagateInPlace(
+                register PyStringObject *, register PyStringObject *,
+                register PyStringObject *);
+PyAPI_FUNC(int) _PyString_CopyTaint(register PyStringObject *,
+                                    register PyStringObject *);
+PyAPI_FUNC(int) _PyString_PropagateTaintInPlace(register PyStringObject *,
+                                                register PyStringObject *);
+PyAPI_FUNC(PyObject*) PyString_AssignTaint(PyStringObject *, PyTaintObject *);
+
+/* Macro which assigns source's taint object to target. It assumes that source
+   is tainted and target is not (ie. is a new string with NULL ob_merits). */
+#define _PyString_COPY_TAINT_REFERENCE(target, source) \
+do { \
+    assert(!PyString_CHECK_TAINTED(target));\
+    assert(PyString_CHECK_TAINTED(source));\
+    assert(target->ob_refcnt == 1);\
+    ((PyStringObject*)target)->ob_merits = \
+      ((PyStringObject*)source)->ob_merits; \
+    Py_INCREF(((PyStringObject*)target)->ob_merits); \
+} while(0);
+
 /* Use only if you know it's a string */
 #define PyString_CHECK_INTERNED(op) (((PyStringObject *)(op))->ob_sstate)
+#define PyString_CHECK_TAINTED(op) (((PyStringObject *)(op))->ob_merits != NULL)
 
 /* Macro, trading safety for speed */
 #define PyString_AS_STRING(op) (((PyStringObject *)(op))->ob_sval)
 #define PyString_GET_SIZE(op)  Py_SIZE(op)
+#define PyString_GET_MERITS(op) (((PyStringObject *)(op))->ob_merits)
+#define PyString_ASSIGN_MERITS(x, t) \
+do {\
+  (((PyStringObject*)x)->ob_merits = t);\
+  Py_XINCREF(t);\
+} while(0);\
 
 /* _PyString_Join(sep, x) is like sep.join(x).  sep must be PyStringObject*,
    x must be an iterable object. */
@@ -107,7 +144,7 @@ PyAPI_FUNC(PyObject*) PyString_Decode(
     const char *errors          /* error handling */
     );
 
-/* Encodes a char buffer of the given size and returns a 
+/* Encodes a char buffer of the given size and returns a
    Python object. */
 
 PyAPI_FUNC(PyObject*) PyString_Encode(
@@ -117,7 +154,7 @@ PyAPI_FUNC(PyObject*) PyString_Encode(
     const char *errors          /* error handling */
     );
 
-/* Encodes a string object and returns the result as Python 
+/* Encodes a string object and returns the result as Python
    object. */
 
 PyAPI_FUNC(PyObject*) PyString_AsEncodedObject(
@@ -127,8 +164,8 @@ PyAPI_FUNC(PyObject*) PyString_AsEncodedObject(
     );
 
 /* Encodes a string object and returns the result as Python string
-   object.   
-   
+   object.
+
    If the codec returns an Unicode object, the object is converted
    back to a string using the default encoding.
 
@@ -140,7 +177,7 @@ PyAPI_FUNC(PyObject*) PyString_AsEncodedString(
     const char *errors		/* error handling */
     );
 
-/* Decodes a string object and returns the result as Python 
+/* Decodes a string object and returns the result as Python
    object. */
 
 PyAPI_FUNC(PyObject*) PyString_AsDecodedObject(
@@ -150,8 +187,8 @@ PyAPI_FUNC(PyObject*) PyString_AsDecodedObject(
     );
 
 /* Decodes a string object and returns the result as Python string
-   object.  
-   
+   object.
+
    If the codec returns an Unicode object, the object is converted
    back to a string using the default encoding.
 

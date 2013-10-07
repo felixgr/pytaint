@@ -270,10 +270,7 @@ int unicode_resize(register PyUnicodeObject *unicode,
        objects) in-place is not allowed. Use PyUnicode_Resize()
        instead ! */
 
-    if (unicode == unicode_empty ||
-        (unicode->length == 1 &&
-         unicode->str[0] < 256U &&
-         unicode_latin1[unicode->str[0]] == unicode)) {
+    if (PyUnicode_IS_SHARED(unicode)) {
         PyErr_SetString(PyExc_SystemError,
                         "can't resize shared unicode objects");
         return -1;
@@ -374,6 +371,7 @@ PyUnicodeObject *_PyUnicode_New(Py_ssize_t length)
     unicode->length = length;
     unicode->hash = -1;
     unicode->defenc = NULL;
+    unicode->merits = NULL;
     return unicode;
 
   onError:
@@ -387,6 +385,7 @@ PyUnicodeObject *_PyUnicode_New(Py_ssize_t length)
 static
 void unicode_dealloc(register PyUnicodeObject *unicode)
 {
+    Py_XDECREF(PyUnicode_GET_MERITS(unicode));
     if (PyUnicode_CheckExact(unicode) &&
         numfree < PyUnicode_MAXFREELIST) {
         /* Keep-Alive optimization */
@@ -451,6 +450,65 @@ int PyUnicode_Resize(PyObject **unicode, Py_ssize_t length)
     return _PyUnicode_Resize((PyUnicodeObject **)unicode, length);
 }
 
+PyObject *PyUnicode_FromUnicodeNoSharing(const Py_UNICODE *u,
+                                         Py_ssize_t size)
+{
+    PyUnicodeObject *unicode;
+    if (size == 0) {
+        size_t new_size;
+        unicode = PyObject_New(PyUnicodeObject, &PyUnicode_Type);
+        if (unicode == NULL)
+            return NULL;
+        new_size = sizeof(Py_UNICODE) * ((size_t)size + 1);
+        unicode->str = (Py_UNICODE*) PyObject_MALLOC(new_size);
+
+        if (!unicode->str) {
+            PyErr_NoMemory();
+            _Py_DEC_REFTOTAL;
+            _Py_ForgetReference((PyObject *)unicode);
+            PyObject_Del(unicode);
+            return NULL;
+        }
+        unicode->str[0] = 0;
+        unicode->str[size] = 0;
+        unicode->length = size;
+        unicode->hash = -1;
+        unicode->defenc = NULL;
+        unicode->merits = NULL;
+        return (PyObject*)unicode;
+    }
+    unicode = _PyUnicode_New(size);
+    if (unicode == NULL)
+        return NULL;
+
+    if (u != NULL)
+        Py_UNICODE_COPY(unicode->str, u, size);
+
+    return (PyObject*)unicode;
+}
+
+PyObject *PyUnicode_FromUnicodeSameMerits(const Py_UNICODE *u,
+                                          Py_ssize_t size,
+                                          PyTaintObject *merits)
+{
+    PyObject *unicode;
+    if (merits == NULL) {
+        unicode = PyUnicode_FromUnicode(u, size);
+    } else {
+        unicode = PyUnicode_FromUnicodeNoSharing(u, size);
+    }
+
+    if (unicode == NULL)
+        return NULL;
+
+    if (merits != NULL) {
+        ((PyUnicodeObject*)unicode)->merits = merits;
+        Py_INCREF(merits);
+    }
+
+    return (PyObject*)unicode;
+}
+
 PyObject *PyUnicode_FromUnicode(const Py_UNICODE *u,
                                 Py_ssize_t size)
 {
@@ -466,7 +524,7 @@ PyObject *PyUnicode_FromUnicode(const Py_UNICODE *u,
 
         /* Single character Unicode objects in the Latin-1 range are
            shared when using this constructor */
-        if (size == 1 && *u < 256) {
+        if (size == 1 && PyUnicode_IS_LATIN_CHAR(u)) {
             unicode = unicode_latin1[*u];
             if (!unicode) {
                 unicode = _PyUnicode_New(1);
@@ -636,6 +694,59 @@ PyObject *PyUnicode_FromWideChar(register const wchar_t *w,
 #endif /* CONVERT_WCHAR_TO_SURROGATES */
 
 #undef CONVERT_WCHAR_TO_SURROGATES
+PyObject*
+PyUnicode_AssignTaint(PyUnicodeObject *u, PyTaintObject *taint) {
+    PyObject *result;
+
+    if (!PyUnicode_Check(u)) {
+        PyErr_Format(PyExc_TypeError,
+                     "Trying to assign taint to object of type %.200s\
+                      (expected unicode).", Py_TYPE(u)->tp_name);
+        return NULL;
+    }
+
+    if (PyUnicode_IS_SHARED(u) || u->ob_refcnt > 1) {
+        result = PyUnicode_FromUnicodeSameMerits(PyUnicode_AS_UNICODE(u),
+                                                 PyUnicode_GET_SIZE(u),
+                                                 taint);
+        Py_DECREF(u);
+    } else {
+        result = (PyObject*)u;
+        Py_XDECREF(PyUnicode_GET_MERITS(u));
+        PyUnicode_ASSIGN_MERITS(u, taint);
+    }
+
+    return result;
+}
+
+
+void
+_PyUnicode_CopyTaint(PyUnicodeObject *target,
+                     PyUnicodeObject *source)
+{
+    // check if it is a shared string?
+    if (PyUnicode_IS_SHARED(target)) {
+        Py_FatalError("Attempted tainting of a shared unicode object");
+    }
+
+    Py_CLEAR(target->merits);
+    if (source->merits != NULL) {
+        target->merits = source->merits;
+        Py_INCREF(target->merits);
+    }
+}
+
+int
+PyUnicode_IsShared(PyUnicodeObject *u) {
+    if (!PyUnicode_Check(u)) {
+        PyErr_SetString(PyExc_TypeError,
+                        "Checking a non-unicode object for unicode sharing");
+        return -1;
+    }
+    return u == unicode_empty ||
+      (u->length == 1 && PyUnicode_IS_LATIN_CHAR(u->str) && \
+       unicode_latin1[u->str[0]] == u);
+}
 
 static void
 makefmt(char *fmt, int longflag, int size_tflag, int zeropad, int width, int precision, char c)
@@ -1103,8 +1214,9 @@ PyObject *PyUnicode_FromObject(register PyObject *obj)
     if (PyUnicode_Check(obj)) {
         /* For a Unicode subtype that's not a Unicode object,
            return a true Unicode object with the same data. */
-        return PyUnicode_FromUnicode(PyUnicode_AS_UNICODE(obj),
-                                     PyUnicode_GET_SIZE(obj));
+        return PyUnicode_FromUnicodeSameMerits(PyUnicode_AS_UNICODE(obj),
+                                               PyUnicode_GET_SIZE(obj),
+                                               PyUnicode_GET_MERITS(obj));
     }
     return PyUnicode_FromEncodedObject(obj, NULL, "strict");
 }
@@ -1171,10 +1283,17 @@ PyObject *PyUnicode_FromEncodedObject(register PyObject *obj,
     }
 
     /* Convert to Unicode */
-    if (len == 0)
-        _Py_RETURN_UNICODE_EMPTY();
+    if (len == 0) {
+        Py_INCREF(unicode_empty);
+        v = (PyObject *)unicode_empty;
+    }
+    else
+        v = PyUnicode_Decode(s, len, encoding, errors);
 
-    v = PyUnicode_Decode(s, len, encoding, errors);
+    if (v != NULL && PyString_Check(obj))
+        v = PyUnicode_AssignTaint((PyUnicodeObject*)v,
+                                  PyString_GET_MERITS(obj));
+
     return v;
 
   onError:
@@ -1243,7 +1362,8 @@ PyObject *PyUnicode_AsDecodedObject(PyObject *unicode,
     v = PyCodec_Decode(unicode, encoding, errors);
     if (v == NULL)
         goto onError;
-    return v;
+
+    return PyTaint_AssignToObject(v, PyUnicode_GET_MERITS(unicode));
 
   onError:
     return NULL;
@@ -1282,7 +1402,8 @@ PyObject *PyUnicode_AsEncodedObject(PyObject *unicode,
     v = PyCodec_Encode(unicode, encoding, errors);
     if (v == NULL)
         goto onError;
-    return v;
+
+    return PyTaint_AssignToObject(v, PyUnicode_GET_MERITS(unicode));
 
   onError:
     return NULL;
@@ -1304,16 +1425,24 @@ PyObject *PyUnicode_AsEncodedString(PyObject *unicode,
 
     /* Shortcuts for common default encodings */
     if (errors == NULL) {
-        if (strcmp(encoding, "utf-8") == 0)
-            return PyUnicode_AsUTF8String(unicode);
-        else if (strcmp(encoding, "latin-1") == 0)
-            return PyUnicode_AsLatin1String(unicode);
+        if (strcmp(encoding, "utf-8") == 0) {
+            v = PyUnicode_AsUTF8String(unicode);
+            goto done;
+        }
+        else if (strcmp(encoding, "latin-1") == 0) {
+            v = PyUnicode_AsLatin1String(unicode);
+            goto done;
+        }
 #if defined(MS_WINDOWS) && defined(HAVE_USABLE_WCHAR_T)
-        else if (strcmp(encoding, "mbcs") == 0)
-            return PyUnicode_AsMBCSString(unicode);
+        else if (strcmp(encoding, "mbcs") == 0) {
+            v = PyUnicode_AsMBCSString(unicode);
+            goto done;
+        }
 #endif
-        else if (strcmp(encoding, "ascii") == 0)
-            return PyUnicode_AsASCIIString(unicode);
+        else if (strcmp(encoding, "ascii") == 0) {
+            v = PyUnicode_AsASCIIString(unicode);
+            goto done;
+        }
     }
 
     /* Encode via the codec registry */
@@ -1327,7 +1456,14 @@ PyObject *PyUnicode_AsEncodedString(PyObject *unicode,
         Py_DECREF(v);
         goto onError;
     }
-    return v;
+    return PyString_AssignTaint((PyStringObject*)v,
+                                PyUnicode_GET_MERITS(unicode));
+
+  done:
+    if (v == NULL)
+        goto onError;
+    return PyString_AssignTaint((PyStringObject*)v,
+                                PyUnicode_GET_MERITS(unicode));
 
   onError:
     return NULL;
@@ -4961,7 +5097,8 @@ int charmaptranslate_output(const Py_UNICODE *startinp, const Py_UNICODE *curinp
 PyObject *PyUnicode_TranslateCharmap(const Py_UNICODE *p,
                                      Py_ssize_t size,
                                      PyObject *mapping,
-                                     const char *errors)
+                                     const char *errors,
+                                     PyTaintObject *taint)
 {
     /* output object */
     PyObject *res = NULL;
@@ -5002,8 +5139,12 @@ PyObject *PyUnicode_TranslateCharmap(const Py_UNICODE *p,
             goto onError;
         }
         Py_XDECREF(x);
-        if (x!=Py_None) /* it worked => adjust input pointer */
+        if (x!=Py_None) { /* it worked => adjust input pointer */
             ++p;
+            if (x != NULL && PyUnicode_Check(x)) {
+                PyTaint_PropagateTo(&taint, PyUnicode_GET_MERITS(x));
+            }
+        }
         else { /* untranslatable character */
             PyObject *repunicode = NULL; /* initialize to prevent gcc warning */
             Py_ssize_t repsize;
@@ -5091,12 +5232,15 @@ PyObject *PyUnicode_TranslateCharmap(const Py_UNICODE *p,
     }
     Py_XDECREF(exc);
     Py_XDECREF(errorHandler);
+    res = PyUnicode_AssignTaint((PyUnicodeObject*)res, taint);
+    Py_XDECREF(taint);
     return res;
 
   onError:
     Py_XDECREF(res);
     Py_XDECREF(exc);
     Py_XDECREF(errorHandler);
+    Py_XDECREF(taint);
     return NULL;
 }
 
@@ -5109,10 +5253,12 @@ PyObject *PyUnicode_Translate(PyObject *str,
     str = PyUnicode_FromObject(str);
     if (str == NULL)
         goto onError;
+    Py_XINCREF(PyUnicode_GET_MERITS(str)); // TranslateCharmap will steal them
     result = PyUnicode_TranslateCharmap(PyUnicode_AS_UNICODE(str),
                                         PyUnicode_GET_SIZE(str),
                                         mapping,
-                                        errors);
+                                        errors,
+                                        PyUnicode_GET_MERITS(str));
     Py_DECREF(str);
     return result;
 
@@ -5403,7 +5549,10 @@ PyObject *fixup(PyUnicodeObject *self,
 
     PyUnicodeObject *u;
 
-    u = (PyUnicodeObject*) PyUnicode_FromUnicode(NULL, self->length);
+    u = (PyUnicodeObject*)PyUnicode_FromUnicodeSameMerits(NULL,
+                                                          self->length,
+                                                          self->merits);
+
     if (u == NULL)
         return NULL;
 
@@ -5560,6 +5709,7 @@ PyUnicode_Join(PyObject *separator, PyObject *seq)
     Py_ssize_t seqlen;              /* len(fseq) -- number of items in sequence */
     PyObject *item;
     Py_ssize_t i;
+    PyTaintObject *taint = NULL;
 
     fseq = PySequence_Fast(seq, "");
     if (fseq == NULL) {
@@ -5574,17 +5724,27 @@ PyUnicode_Join(PyObject *separator, PyObject *seq)
      * is invariant.
      */
     seqlen = PySequence_Fast_GET_SIZE(fseq);
+    taint = _PyTaint_GetFromObject(separator);
     /* If empty sequence, return u"". */
     if (seqlen == 0) {
-        res = _PyUnicode_New(0);  /* empty sequence; return u"" */
+        res = (PyUnicodeObject*)PyUnicode_FromUnicodeSameMerits(NULL, 0, taint);
         goto Done;
     }
     /* If singleton sequence with an exact Unicode, return that. */
     if (seqlen == 1) {
         item = PySequence_Fast_GET_ITEM(fseq, 0);
         if (PyUnicode_CheckExact(item)) {
-            Py_INCREF(item);
-            res = (PyUnicodeObject *)item;
+            if (PyTaint_PropagateTo(&taint, PyUnicode_GET_MERITS(item)) == -1)
+                goto onError;
+            if (PyTaint_IS_CLEAN(taint)) {
+                Py_INCREF(item);
+                res = (PyUnicodeObject *)item;
+            } else {
+                res = (PyUnicodeObject *)PyUnicode_FromUnicodeSameMerits(
+                                                PyUnicode_AS_UNICODE(item),
+                                                PyUnicode_GET_SIZE(item),
+                                                taint);
+            }
             goto Done;
         }
     }
@@ -5666,6 +5826,13 @@ PyUnicode_Join(PyObject *separator, PyObject *seq)
             Py_UNICODE_COPY(res_p, sep, seplen);
             res_p += seplen;
         }
+
+        /* Propagate taint from item */
+        if (PyTaint_PropagateTo(&taint, PyUnicode_GET_MERITS(item)) == -1) {
+            Py_DECREF(item);
+            goto onError;
+        }
+
         Py_DECREF(item);
         res_used = new_res_used;
     }
@@ -5676,9 +5843,12 @@ PyUnicode_Join(PyObject *separator, PyObject *seq)
     if (_PyUnicode_Resize(&res, res_used) < 0)
         goto onError;
 
+    res = (PyUnicodeObject*)PyUnicode_AssignTaint(res, taint);
+
   Done:
     Py_XDECREF(internal_separator);
     Py_DECREF(fseq);
+    Py_XDECREF(taint);
     return (PyObject *)res;
 
   Overflow:
@@ -5690,6 +5860,7 @@ PyUnicode_Join(PyObject *separator, PyObject *seq)
   onError:
     Py_XDECREF(internal_separator);
     Py_DECREF(fseq);
+    Py_XDECREF(taint);
     Py_XDECREF(res);
     return NULL;
 }
@@ -5729,20 +5900,134 @@ PyUnicodeObject *pad(PyUnicodeObject *self,
     return u;
 }
 
+#define PAD_CENTER 0
+#define PAD_LJUST 1
+#define PAD_RJUST 2
+
+static
+PyUnicodeObject *do_padding(PyUnicodeObject *self,
+                            PyObject *args,
+                            int padtype) {
+    Py_ssize_t left, right, marg;
+    Py_ssize_t width;
+    PyObject *padding = Py_None;
+    Py_UNICODE fillchar = ' ';
+    PyObject *result = NULL;
+    PyTaintObject *taintobj = NULL;
+
+    if (!PyArg_ParseTuple(args, "n|O:center", &width, &padding))
+        return NULL;
+
+    if (padding == Py_None) {
+        fillchar = ' ';
+        taintobj = PyUnicode_GET_MERITS(self);
+    } else {
+        padding = PyUnicode_FromObject(padding);
+        if (PyUnicode_GET_SIZE(padding) != 1) {
+            PyErr_SetString(PyExc_TypeError,
+                      "The fill character must be exactly one character long");
+            Py_DECREF(padding);
+            return 0;
+        }
+        fillchar = ((PyUnicodeObject*)padding)->str[0];
+        if (PyTaint_PropagationResult(&taintobj,
+                                      PyUnicode_GET_MERITS(self),
+                                      PyUnicode_GET_MERITS(padding)) == -1)
+            return NULL;
+    }
+
+    if (self->length >= width && PyUnicode_CheckExact(self)) {
+        if (PyString_GET_MERITS(self) == taintobj) {
+            Py_INCREF(self);
+            result = (PyObject*)self;
+            goto done;
+        }
+        result = PyUnicode_FromUnicodeSameMerits(PyUnicode_AS_UNICODE(self),
+                                                 PyUnicode_GET_SIZE(self),
+                                                 PyUnicode_GET_MERITS(self));
+
+        // no error check because either way cleanup is the same; also
+        // in case of failure, result is NULL
+        goto done;
+    } else {
+        switch (padtype) {
+        case PAD_CENTER:
+            marg = width - PyUnicode_GET_SIZE(self);
+            left = marg / 2 + (marg & width & 1);
+            right = marg - left;
+            break;
+        case PAD_LJUST:
+            left = 0;
+            right = width - PyUnicode_GET_SIZE(self);
+            break;
+        case PAD_RJUST:
+            left = width - PyUnicode_GET_SIZE(self);
+            right = 0;
+            break;
+        default:
+            Py_FatalError("Unknown padding type passed to do_padding");
+            return NULL;
+        }
+        result = (PyObject*)pad(self, left, right, fillchar);
+        if (result == NULL)
+            goto done;
+
+        if (!PyTaint_IS_CLEAN(taintobj)) {
+            // try to reuse result
+            if (PyUnicode_IS_SHARED(result)) {
+                ((PyUnicodeObject*)result)->merits = taintobj;
+                Py_XINCREF(taintobj);
+            } else {
+                PyObject *tmp;
+                tmp = PyUnicode_FromUnicodeSameMerits(
+                                        PyUnicode_AS_UNICODE(result),
+                                        PyUnicode_GET_SIZE(result),
+                                        taintobj);
+
+                // again, error check is unnecessary
+                Py_DECREF(result);
+                result = tmp;
+            }
+        }
+    }
+
+  done:
+    if (padding != Py_None)
+        Py_XDECREF(taintobj);
+    // when padding == NULL, taintobj is borrowed from self, so no decref
+    return (PyUnicodeObject*)result;
+
+}
+
 PyObject *PyUnicode_Splitlines(PyObject *string, int keepends)
 {
     PyObject *list;
+    PyTaintObject *taint = NULL;
 
     string = PyUnicode_FromObject(string);
     if (string == NULL)
         return NULL;
+
+    taint = PyUnicode_GET_MERITS(string);
+    Py_XINCREF(taint);
 
     list = stringlib_splitlines(
         (PyObject*) string, PyUnicode_AS_UNICODE(string),
         PyUnicode_GET_SIZE(string), keepends);
 
     Py_DECREF(string);
+    if (list == NULL)
+        goto onError;
+    if (_PyTaint_TaintUnicodeListItems(list, taint) == -1)
+        goto onError;
+
+    Py_XDECREF(taint);
     return list;
+
+  onError:
+    Py_XDECREF(list);
+    Py_XDECREF(taint);
+    return NULL;
 }
 
 static
@@ -5750,19 +6035,43 @@ PyObject *split(PyUnicodeObject *self,
                 PyUnicodeObject *substring,
                 Py_ssize_t maxcount)
 {
+    PyObject *result = NULL;
+    PyTaintObject *taint = NULL;
+
     if (maxcount < 0)
         maxcount = PY_SSIZE_T_MAX;
 
-    if (substring == NULL)
-        return stringlib_split_whitespace(
+    if (substring == NULL) {
+        taint = PyUnicode_GET_MERITS(self);
+        Py_XINCREF(taint);
+        result = stringlib_split_whitespace(
             (PyObject*) self,  self->str, self->length, maxcount
             );
+    } else {
+        if (PyTaint_PropagationResult(&taint,
+                                      PyUnicode_GET_MERITS(self),
+                                      PyUnicode_GET_MERITS(substring)) == -1)
+            goto onError;
 
-    return stringlib_split(
-        (PyObject*) self,  self->str, self->length,
-        substring->str, substring->length,
-        maxcount
-        );
+        result = stringlib_split(
+            (PyObject*) self,  self->str, self->length,
+            substring->str, substring->length,
+            maxcount
+            );
+    }
+    if (result == NULL)
+        goto onError;
+
+    if (_PyTaint_TaintUnicodeListItems(result, taint) == -1)
+        goto onError;
+
+    Py_XDECREF(taint);
+    return result;
+
+  onError:
+    Py_XDECREF(taint);
+    Py_XDECREF(result);
+    return NULL;
 }
 
 static
@@ -5770,19 +6079,42 @@ PyObject *rsplit(PyUnicodeObject *self,
                  PyUnicodeObject *substring,
                  Py_ssize_t maxcount)
 {
+    PyObject *result = NULL;
+    PyTaintObject *taint = NULL;
+
     if (maxcount < 0)
         maxcount = PY_SSIZE_T_MAX;
 
-    if (substring == NULL)
-        return stringlib_rsplit_whitespace(
+    if (substring == NULL) {
+        taint = PyUnicode_GET_MERITS(self);
+        Py_XINCREF(taint);
+        result = stringlib_rsplit_whitespace(
             (PyObject*) self,  self->str, self->length, maxcount
             );
+    } else {
+        if (PyTaint_PropagationResult(&taint,
+                                      PyUnicode_GET_MERITS(self),
+                                      PyUnicode_GET_MERITS(substring)) == -1)
+            goto onError;
 
-    return stringlib_rsplit(
-        (PyObject*) self,  self->str, self->length,
-        substring->str, substring->length,
-        maxcount
-        );
+        result = stringlib_rsplit(
+            (PyObject*) self,  self->str, self->length,
+            substring->str, substring->length,
+            maxcount
+            );
+    }
+    if (result == NULL)
+        goto onError;
+    if (_PyTaint_TaintUnicodeListItems(result, taint) == -1)
+        goto onError;
+
+    Py_XDECREF(taint);
+    return result;
+
+  onError:
+    Py_XDECREF(taint);
+    Py_XDECREF(result);
+    return NULL;
 }
 
 static
@@ -5792,6 +6124,17 @@ PyObject *replace(PyUnicodeObject *self,
                   Py_ssize_t maxcount)
 {
     PyUnicodeObject *u;
+    PyTaintObject *taint = NULL;
+
+    if (PyTaint_PropagationResult(&taint, PyUnicode_GET_MERITS(self),
+                                  PyUnicode_GET_MERITS(str1)) == -1)
+        return NULL;
+    if (PyTaint_PropagateTo(&taint, PyUnicode_GET_MERITS(str2)) == -1) {
+        Py_XDECREF(taint);
+        return NULL;
+    }
+
+
 
     if (maxcount < 0)
         maxcount = PY_SSIZE_T_MAX;
@@ -5808,7 +6151,8 @@ PyObject *replace(PyUnicodeObject *self,
             Py_UNICODE u1, u2;
             if (!findchar(self->str, self->length, str1->str[0]))
                 goto nothing;
-            u = (PyUnicodeObject*) PyUnicode_FromUnicode(NULL, self->length);
+            u = (PyUnicodeObject*) PyUnicode_FromUnicodeSameMerits(NULL,
+                                                     self->length, taint);
             if (!u)
                 return NULL;
             Py_UNICODE_COPY(u->str, self->str, self->length);
@@ -5826,7 +6170,8 @@ PyObject *replace(PyUnicodeObject *self,
                 );
             if (i < 0)
                 goto nothing;
-            u = (PyUnicodeObject*) PyUnicode_FromUnicode(NULL, self->length);
+            u = (PyUnicodeObject*) PyUnicode_FromUnicodeSameMerits(NULL,
+                                                     self->length, taint);
             if (!u)
                 return NULL;
             Py_UNICODE_COPY(u->str, self->str, self->length);
@@ -5874,7 +6219,8 @@ PyObject *replace(PyUnicodeObject *self,
                 return NULL;
             }
         }
-        u = _PyUnicode_New(new_size);
+        u = (PyUnicodeObject*)PyUnicode_FromUnicodeSameMerits(NULL,
+                                                              new_size, taint);
         if (!u)
             return NULL;
         i = 0;
@@ -5918,11 +6264,11 @@ PyObject *replace(PyUnicodeObject *self,
 
   nothing:
     /* nothing to replace; return original string (when possible) */
-    if (PyUnicode_CheckExact(self)) {
+    if (PyUnicode_CheckExact(self) && PyUnicode_GET_MERITS(self) == taint) {
         Py_INCREF(self);
         return (PyObject *) self;
     }
-    return PyUnicode_FromUnicode(self->str, self->length);
+    return PyUnicode_FromUnicodeSameMerits(self->str, self->length, taint);
 }
 
 /* --- Unicode Object Methods --------------------------------------------- */
@@ -6025,22 +6371,7 @@ done using the specified fill character (default is a space)");
 static PyObject *
 unicode_center(PyUnicodeObject *self, PyObject *args)
 {
-    Py_ssize_t marg, left;
-    Py_ssize_t width;
-    Py_UNICODE fillchar = ' ';
-
-    if (!PyArg_ParseTuple(args, "n|O&:center", &width, convert_uc, &fillchar))
-        return NULL;
-
-    if (self->length >= width && PyUnicode_CheckExact(self)) {
-        Py_INCREF(self);
-        return (PyObject*) self;
-    }
-
-    marg = width - self->length;
-    left = marg / 2 + (marg & width & 1);
-
-    return (PyObject*) pad(self, left, marg - left, fillchar);
+    return (PyObject*)do_padding(self, args, PAD_CENTER);
 }
 
 #if 0
@@ -6273,18 +6604,28 @@ PyObject *PyUnicode_Concat(PyObject *left,
     if (v == NULL)
         goto onError;
 
-    /* Shortcuts */
-    if (v == unicode_empty) {
-        Py_DECREF(v);
-        return (PyObject *)u;
-    }
-    if (u == unicode_empty) {
-        Py_DECREF(u);
-        return (PyObject *)v;
+    if (PyUnicode_CHECK_TAINTED(u) || PyUnicode_CHECK_TAINTED(v)) {
+        w = (PyUnicodeObject*)PyUnicode_FromUnicodeNoSharing(NULL,
+                                                  u->length + v->length);
+        if (PyTaint_PropagationResult(&PyUnicode_GET_MERITS(w),
+                                      PyUnicode_GET_MERITS(u),
+                                      PyUnicode_GET_MERITS(v)) == -1)
+            goto onError;
+    } else {
+        /* Shortcuts */
+        if (v == unicode_empty) {
+            Py_DECREF(v);
+            return (PyObject *)u;
+        }
+        if (u == unicode_empty) {
+            Py_DECREF(u);
+            return (PyObject *)v;
+        }
+
+        w = _PyUnicode_New(u->length + v->length);
     }
 
     /* Concat the two Unicode strings */
-    w = _PyUnicode_New(u->length + v->length);
     if (w == NULL)
         goto onError;
     Py_UNICODE_COPY(w->str, u->str, u->length);
@@ -6456,7 +6797,8 @@ unicode_expandtabs(PyUnicodeObject *self, PyObject *args)
         goto overflow1;
 
     /* Second pass: create output string and fill it */
-    u = _PyUnicode_New(i + j);
+    u = (PyUnicodeObject*)PyUnicode_FromUnicodeSameMerits(NULL, i + j,
+                                          PyUnicode_GET_MERITS(self));
     if (!u)
         return NULL;
 
@@ -6534,7 +6876,8 @@ unicode_getitem(PyUnicodeObject *self, Py_ssize_t index)
         return NULL;
     }
 
-    return (PyObject*) PyUnicode_FromUnicode(&self->str[index], 1);
+    return (PyObject*) PyUnicode_FromUnicodeSameMerits(
+                            &self->str[index], 1, PyUnicode_GET_MERITS(self));
 }
 
 static long
@@ -6927,18 +7270,7 @@ done using the specified fill character (default is a space).");
 static PyObject *
 unicode_ljust(PyUnicodeObject *self, PyObject *args)
 {
-    Py_ssize_t width;
-    Py_UNICODE fillchar = ' ';
-
-    if (!PyArg_ParseTuple(args, "n|O&:ljust", &width, convert_uc, &fillchar))
-        return NULL;
-
-    if (self->length >= width && PyUnicode_CheckExact(self)) {
-        Py_INCREF(self);
-        return (PyObject*) self;
-    }
-
-    return (PyObject*) pad(self, 0, width - self->length, fillchar);
+    return (PyObject*)do_padding(self, args, PAD_LJUST);
 }
 
 PyDoc_STRVAR(lower__doc__,
@@ -6970,6 +7302,10 @@ _PyUnicode_XStrip(PyUnicodeObject *self, int striptype, PyObject *sepobj)
     Py_UNICODE *sep = PyUnicode_AS_UNICODE(sepobj);
     Py_ssize_t seplen = PyUnicode_GET_SIZE(sepobj);
     Py_ssize_t i, j;
+    PyTaintObject *taint = NULL;
+    if (PyTaint_PropagationResult(&taint, PyUnicode_GET_MERITS(self),
+                                  PyUnicode_GET_MERITS(sepobj)) == -1)
+        return NULL;
 
     BLOOM_MASK sepmask = make_bloom_mask(sep, seplen);
 
@@ -6988,12 +7324,13 @@ _PyUnicode_XStrip(PyUnicodeObject *self, int striptype, PyObject *sepobj)
         j++;
     }
 
-    if (i == 0 && j == len && PyUnicode_CheckExact(self)) {
+    if (i == 0 && j == len && PyUnicode_CheckExact(self) &&
+        PyUnicode_GET_MERITS(self) == taint) {
         Py_INCREF(self);
         return (PyObject*)self;
     }
     else
-        return PyUnicode_FromUnicode(s+i, j-i);
+        return PyUnicode_FromUnicodeSameMerits(s+i, j-i, taint);
 }
 
 
@@ -7023,7 +7360,8 @@ do_strip(PyUnicodeObject *self, int striptype)
         return (PyObject*)self;
     }
     else
-        return PyUnicode_FromUnicode(s+i, j-i);
+        return PyUnicode_FromUnicodeSameMerits(s+i, j-i,
+                                               PyUnicode_GET_MERITS(self));
 }
 
 
@@ -7143,7 +7481,9 @@ unicode_repeat(PyUnicodeObject *str, Py_ssize_t len)
                         "repeated string is too long");
         return NULL;
     }
-    u = _PyUnicode_New(nchars);
+
+    u = (PyUnicodeObject*)PyUnicode_FromUnicodeSameMerits(
+                                    NULL, nchars, PyUnicode_GET_MERITS(str));
     if (!u)
         return NULL;
 
@@ -7315,18 +7655,7 @@ done using the specified fill character (default is a space).");
 static PyObject *
 unicode_rjust(PyUnicodeObject *self, PyObject *args)
 {
-    Py_ssize_t width;
-    Py_UNICODE fillchar = ' ';
-
-    if (!PyArg_ParseTuple(args, "n|O&:rjust", &width, convert_uc, &fillchar))
-        return NULL;
-
-    if (self->length >= width && PyUnicode_CheckExact(self)) {
-        Py_INCREF(self);
-        return (PyObject*) self;
-    }
-
-    return (PyObject*) pad(self, width - self->length, 0, fillchar);
+    return (PyObject*)do_padding(self, args, PAD_RJUST);
 }
 
 static PyObject*
@@ -7347,8 +7676,8 @@ unicode_slice(PyUnicodeObject *self, Py_ssize_t start, Py_ssize_t end)
     if (start > end)
         start = end;
     /* copy slice */
-    return (PyObject*) PyUnicode_FromUnicode(self->str + start,
-                                             end - start);
+   return (PyObject*) PyUnicode_FromUnicodeSameMerits(
+       self->str + start, end - start, PyUnicode_GET_MERITS(self));
 }
 
 PyObject *PyUnicode_Split(PyObject *s,
@@ -7407,6 +7736,7 @@ PyUnicode_Partition(PyObject *str_in, PyObject *sep_in)
     PyObject* str_obj;
     PyObject* sep_obj;
     PyObject* out;
+    PyTaintObject *taint = NULL;
 
     str_obj = PyUnicode_FromObject(str_in);
     if (!str_obj)
@@ -7422,6 +7752,22 @@ PyUnicode_Partition(PyObject *str_in, PyObject *sep_in)
         sep_obj, PyUnicode_AS_UNICODE(sep_obj), PyUnicode_GET_SIZE(sep_obj)
         );
 
+    if (out == NULL)
+        goto done;
+
+    if (PyUnicode_CHECK_TAINTED(str_obj) || PyUnicode_CHECK_TAINTED(sep_obj)) {
+        if (PyTaint_PropagationResult(&taint, PyUnicode_GET_MERITS(str_obj),
+                                      PyUnicode_GET_MERITS(sep_obj)) == -1) {
+            Py_DECREF(out);
+            out = NULL;
+            goto done;
+        }
+        out = _PyTaint_TaintUnicodeTupleItems(out, taint);
+        // Can't be NULL, because str_obj or sep_obj (or both) is tainted
+        Py_DECREF(taint);
+    }
+
+  done:
     Py_DECREF(sep_obj);
     Py_DECREF(str_obj);
 
@@ -7435,6 +7781,7 @@ PyUnicode_RPartition(PyObject *str_in, PyObject *sep_in)
     PyObject* str_obj;
     PyObject* sep_obj;
     PyObject* out;
+    PyTaintObject *taint = NULL;
 
     str_obj = PyUnicode_FromObject(str_in);
     if (!str_obj)
@@ -7450,6 +7797,22 @@ PyUnicode_RPartition(PyObject *str_in, PyObject *sep_in)
         sep_obj, PyUnicode_AS_UNICODE(sep_obj), PyUnicode_GET_SIZE(sep_obj)
         );
 
+    if (out == NULL)
+        goto done;
+
+    if (PyUnicode_CHECK_TAINTED(str_obj) || PyUnicode_CHECK_TAINTED(sep_obj)) {
+        if (PyTaint_PropagationResult(&taint, PyUnicode_GET_MERITS(str_obj),
+                                      PyUnicode_GET_MERITS(sep_obj)) == -1) {
+            Py_DECREF(out);
+            out = NULL;
+            goto done;
+        }
+        out = _PyTaint_TaintUnicodeTupleItems(out, taint);
+        // Can't be NULL, because str_obj or sep_obj (or both) is tainted
+        Py_DECREF(taint);
+    }
+
+  done:
     Py_DECREF(sep_obj);
     Py_DECREF(str_obj);
 
@@ -7580,10 +7943,12 @@ are deleted.");
 static PyObject*
 unicode_translate(PyUnicodeObject *self, PyObject *table)
 {
+    Py_XINCREF(PyUnicode_GET_MERITS(self)); // TranslateCharmap will steal them
     return PyUnicode_TranslateCharmap(self->str,
                                       self->length,
                                       table,
-                                      "ignore");
+                                      "ignore",
+                                      PyUnicode_GET_MERITS(self));
 }
 
 PyDoc_STRVAR(upper__doc__,
@@ -7619,9 +7984,10 @@ unicode_zfill(PyUnicodeObject *self, PyObject *args)
             return (PyObject*) self;
         }
         else
-            return PyUnicode_FromUnicode(
+            return PyUnicode_FromUnicodeSameMerits(
                 PyUnicode_AS_UNICODE(self),
-                PyUnicode_GET_SIZE(self)
+                PyUnicode_GET_SIZE(self),
+                PyUnicode_GET_MERITS(self)
                 );
     }
 
@@ -7636,6 +8002,19 @@ unicode_zfill(PyUnicodeObject *self, PyObject *args)
         /* move sign to beginning of string */
         u->str[0] = u->str[fill];
         u->str[fill] = '0';
+    }
+
+    if (u != self && PyUnicode_CHECK_TAINTED(self)) {
+        if (PyUnicode_IS_SHARED(u)) {
+            PyObject *tmp;
+            tmp = PyUnicode_FromUnicodeSameMerits(PyUnicode_AS_UNICODE(u),
+                                                  PyUnicode_GET_SIZE(u),
+                                                  PyUnicode_GET_MERITS(self));
+            Py_DECREF(u);
+            u = (PyUnicodeObject*)tmp;
+        } else {
+            PyUnicode_ASSIGN_MERITS(u, PyUnicode_GET_MERITS(self));
+        }
     }
 
     return (PyObject*) u;
@@ -7802,6 +8181,142 @@ PyDoc_STRVAR(sizeof__doc__,
 ");
 
 static PyObject *
+unicode_taint(PyUnicodeObject *v)
+{
+    PyObject *u;
+    PyTaintObject *t;
+    t = PyTaint_EmptyMerits();
+
+    if (t == NULL)
+        return NULL;
+
+    u = PyUnicode_FromUnicodeSameMerits(PyUnicode_AS_UNICODE(v),
+                                        PyUnicode_GET_SIZE(v),
+                                        t);
+    Py_DECREF(t);
+    return u;
+}
+
+PyDoc_STRVAR(taint__doc__,
+             "S.taint() -> unicode\n\
+\n\
+Return a tainted copy of S without any merits.");
+
+static PyObject *
+unicode_istainted(PyUnicodeObject *v)
+{
+    long taint_val = (long)(PyUnicode_CHECK_TAINTED(v));
+    return PyBool_FromLong(taint_val);
+}
+
+PyDoc_STRVAR(istainted__doc__,
+             "S.istainted() -> bool\n\
+\n\
+Return True if S is tainted, False otherwise.");
+
+static PyObject *
+unicode_isclean(PyUnicodeObject *v, PyObject *args)
+{
+    PyObject *merit = Py_None;
+    if (!PyArg_ParseTuple(args, "|O:isclean", &merit))
+        return NULL;
+
+    if (v->merits == NULL) {
+        Py_RETURN_TRUE;
+    }
+
+    if (merit == Py_None) {
+        Py_RETURN_FALSE;
+    }
+
+    if (!PyObject_HasAttrString(merit, "propagation")) {
+        PyErr_SetString(PyExc_TypeError,
+                        "Invalid merit object passed.");
+        return NULL;
+    }
+
+    switch (PySequence_Contains((PyObject*)PyUnicode_GET_MERITS(v),
+                                merit)) {
+        case -1:
+            return NULL;
+        case 1:
+            Py_RETURN_TRUE;
+    }
+    Py_RETURN_FALSE;
+}
+
+PyDoc_STRVAR(isclean__doc__,
+             "S.isclean([merit]) -> bool\n\
+\n\
+If no merit is specified return False if S is tainted, True otherwise. If a\n\
+merit is specified return False when S is tainted and doesn't have given\n\
+merit, True otherwise.");
+
+static PyObject *
+unicode_cleanfor(PyUnicodeObject *v, PyObject *merit)
+{
+    PyUnicodeObject *u;
+    PyTaintObject *taint, *new_taint;
+
+    if (_PyTaint_ValidMerit(merit) == -1)
+        return NULL;
+
+    if (PyUnicode_CHECK_TAINTED(v)) {
+        taint = PyUnicode_GET_MERITS(v);
+        Py_INCREF(taint);
+    } else {
+        taint = PyTaint_EmptyMerits();
+        if (taint == NULL)
+            return NULL;
+    }
+
+    new_taint = _PyTaint_AddMerit(taint, merit);
+    Py_DECREF(taint);
+    u = (PyUnicodeObject*)PyUnicode_FromUnicodeSameMerits(
+                                      PyUnicode_AS_UNICODE(v),
+                                      PyUnicode_GET_SIZE(v),
+                                      new_taint);
+    if (u == NULL)
+        return NULL;
+    Py_DECREF(new_taint);
+    return (PyObject*)u;
+}
+
+PyDoc_STRVAR(cleanfor__doc__,
+             "S._cleanfor(M) -> unicode\n\
+\n\
+Return a tainted copy of S which has merit M. All other merits of S are also\n\
+copied to return value.");
+
+static PyObject *
+unicode_listmerits(PyUnicodeObject *v)
+{
+    if (!PyUnicode_CHECK_TAINTED(v)) {
+        Py_RETURN_NONE;
+    }
+
+    return PySet_New((PyObject*)PyUnicode_GET_MERITS(v));
+}
+
+PyDoc_STRVAR(listmerits__doc__,
+             "S._merits() -> set of merits\n\
+\n\
+If S is tainted, return its set of merits. If S is untainted, return None.");
+
+static PyObject *
+unicode_propagate(PyUnicodeObject *v, PyUnicodeObject *source)
+{
+    return PyUnicode_FromUnicodeSameMerits(PyUnicode_AS_UNICODE(v),
+                                           PyUnicode_GET_SIZE(v),
+                                           PyUnicode_GET_MERITS(source));
+}
+
+PyDoc_STRVAR(propagate__doc__,
+             "S._propagate(T) -> unicode\n\
+\n\
+Return a copy of S, which has the same merits as T.");
+
+static PyObject *
 unicode_getnewargs(PyUnicodeObject *v)
 {
     return Py_BuildValue("(u#)", v->str, v->length);
@@ -7827,6 +8342,12 @@ static PyMethodDef unicode_methods[] = {
     {"lstrip", (PyCFunction) unicode_lstrip, METH_VARARGS, lstrip__doc__},
     {"decode", (PyCFunction) unicode_decode, METH_VARARGS | METH_KEYWORDS, decode__doc__},
 /*  {"maketrans", (PyCFunction) unicode_maketrans, METH_VARARGS, maketrans__doc__}, */
+    {"taint", (PyCFunction)unicode_taint, METH_NOARGS, taint__doc__},
+    {"isclean", (PyCFunction)unicode_isclean, METH_VARARGS, isclean__doc__},
+    {"istainted", (PyCFunction)unicode_istainted, METH_NOARGS, istainted__doc__},
+    {"_cleanfor", (PyCFunction)unicode_cleanfor, METH_O, cleanfor__doc__},
+    {"_merits", (PyCFunction)unicode_listmerits, METH_NOARGS, listmerits__doc__},
+    {"_propagate", (PyCFunction)unicode_propagate, METH_O, propagate__doc__},
     {"rfind", (PyCFunction) unicode_rfind, METH_VARARGS, rfind__doc__},
     {"rindex", (PyCFunction) unicode_rindex, METH_VARARGS, rindex__doc__},
     {"rjust", (PyCFunction) unicode_rjust, METH_VARARGS, rjust__doc__},
@@ -7918,13 +8439,15 @@ unicode_subscript(PyUnicodeObject* self, PyObject* item)
         }
 
         if (slicelength <= 0) {
-            return PyUnicode_FromUnicode(NULL, 0);
+            return PyUnicode_FromUnicodeSameMerits(NULL, 0,
+                                                   PyUnicode_GET_MERITS(self));
         } else if (start == 0 && step == 1 && slicelength == self->length &&
                    PyUnicode_CheckExact(self)) {
             Py_INCREF(self);
             return (PyObject *)self;
         } else if (step == 1) {
-            return PyUnicode_FromUnicode(self->str + start, slicelength);
+            return PyUnicode_FromUnicodeSameMerits(self->str + start,
+                                slicelength, PyUnicode_GET_MERITS(self));
         } else {
             source_buf = PyUnicode_AS_UNICODE((PyObject*)self);
             result_buf = (Py_UNICODE *)PyObject_MALLOC(slicelength*
@@ -7937,7 +8460,8 @@ unicode_subscript(PyUnicodeObject* self, PyObject* item)
                 result_buf[i] = source_buf[cur];
             }
 
-            result = PyUnicode_FromUnicode(result_buf, slicelength);
+            result = PyUnicode_FromUnicodeSameMerits(result_buf,
+                              slicelength, PyUnicode_GET_MERITS(self));
             PyObject_FREE(result_buf);
             return result;
         }
@@ -8262,6 +8786,7 @@ PyObject *PyUnicode_Format(PyObject *format,
     PyUnicodeObject *result = NULL;
     PyObject *dict = NULL;
     PyObject *uformat;
+    PyTaintObject *taint = NULL;
 
     if (format == NULL || args == NULL) {
         PyErr_BadInternalCall();
@@ -8272,6 +8797,8 @@ PyObject *PyUnicode_Format(PyObject *format,
         return NULL;
     fmt = PyUnicode_AS_UNICODE(uformat);
     fmtcnt = PyUnicode_GET_SIZE(uformat);
+    taint = PyUnicode_GET_MERITS(uformat);
+    Py_XINCREF(taint);
 
     reslen = rescnt = fmtcnt + 100;
     result = _PyUnicode_New(reslen);
@@ -8513,6 +9040,11 @@ PyObject *PyUnicode_Format(PyObject *format,
                         goto onError;
                     }
                 }
+                if (PyTaint_PropagateTo(&taint,
+                                        PyUnicode_GET_MERITS(temp)) == -1) {
+                    Py_XDECREF(temp);
+                    goto onError;
+                }
                 pbuf = PyUnicode_AS_UNICODE(temp);
                 len = PyUnicode_GET_SIZE(temp);
                 if (prec >= 0 && len > prec)
@@ -8702,9 +9234,11 @@ PyObject *PyUnicode_Format(PyObject *format,
         Py_DECREF(args);
     }
     Py_DECREF(uformat);
-    return (PyObject *)result;
+
+    return PyUnicode_AssignTaint(result, taint);
 
   onError:
+    Py_XDECREF(taint);
     Py_XDECREF(result);
     Py_DECREF(uformat);
     if (args_owned) {

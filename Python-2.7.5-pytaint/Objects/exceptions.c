@@ -1950,6 +1950,11 @@ SimpleExtendsException(PyExc_StandardError, MemoryError, "Out of memory.");
  */
 SimpleExtendsException(PyExc_StandardError, BufferError, "Buffer error.");
 
+/*
+ *    TaintError extends StandardError
+ */
+SimpleExtendsException(PyExc_StandardError, TaintError,
+                       "Taint policy violation.");
 
 /* Warning category docstrings */
 
@@ -2102,6 +2107,7 @@ _PyExc_Init(void)
     PRE_INIT(ReferenceError)
     PRE_INIT(MemoryError)
     PRE_INIT(BufferError)
+    PRE_INIT(TaintError)
     PRE_INIT(Warning)
     PRE_INIT(UserWarning)
     PRE_INIT(DeprecationWarning)
@@ -2171,6 +2177,7 @@ _PyExc_Init(void)
     POST_INIT(ReferenceError)
     POST_INIT(MemoryError)
     POST_INIT(BufferError)
+    POST_INIT(TaintError)
     POST_INIT(Warning)
     POST_INIT(UserWarning)
     POST_INIT(DeprecationWarning)
