@@ -1,0 +1,10 @@
+{
+  "cleaners": [
+    {"merit": "MockModule.MeritX"},
+     "MockModule.MockClass.instance_cleaner"],
+  "sinks": [
+    {"merit": "MockModule.MeritX"},
+     "MockModule.MockClass.instance_sink"],
+  "sources": [
+    "MockModule.MockClass.instance_source"]
+}

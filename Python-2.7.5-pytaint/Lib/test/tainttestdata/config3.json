@@ -1,0 +1,7 @@
+{
+  "propagators" : 
+      [
+        "PropagatorTest.Person",
+        "toplevel_propagator"
+      ]
+}

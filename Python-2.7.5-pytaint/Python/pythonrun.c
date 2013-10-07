@@ -211,6 +211,8 @@ Py_InitializeEx(int install_sigs)
     _PyUnicode_Init();
 #endif
 
+    _PyTaint_Init();
+
     bimod = _PyBuiltin_Init();
     if (bimod == NULL)
         Py_FatalError("Py_Initialize: can't initialize __builtin__");

@@ -1,0 +1,47 @@
+{
+  "foo": [],
+  "bar": [],
+  "baz": [],
+  "cleaners": [
+     "cleaner_f",
+    {"merit": "MeritA"},
+    {"merit": "MeritB"},
+     "toplevel_cleaner",
+     [],
+    {"merit": "MeritC"}],
+  "sinks": [
+     "function_f",
+    {"merit": "MeritD"},
+    {"merit": "MeritE"},
+    {"complex_sink": {
+      "args": []}},
+      "function_g",
+    {"complex_sink_2": {
+      "foobar": [],
+      "args": []}},
+    {"complex_sink_3": {
+      "args": "zxcv"}},
+    {"complex_sink_4": {
+      "kwargs": "zxcv"}},
+    {"complex_sink_5": {
+      "kwargs": [["qwer"]]}},
+    {"complex_sink_6": {
+      "kwargs": [{}]}},
+    {"complex_sink_7": {
+      "kwargs": [{"aaa": 1234}]}},
+    {"complex_sink_8": {
+      "kwargs": [{"bbb": [5]}]}},
+    ["unexpected", "object"],
+    {"merit": "MeritF"}
+  ],
+  "sources": [
+    "SimplePatcherTest.InnerClass.static_source",
+    "SimplePatcherTest.InnerClass.instance_source",
+    "SimplePatcherTest.InnerClass.class_source",
+    "toplevel_source"],
+  "options": [
+    "propagate_re",
+    "foo",
+    "bar"
+  ]
+}

@@ -47,7 +47,8 @@ typedef struct {
 /* forward declaration for recursion */
 static PyObject *
 build_string(SubString *input, PyObject *args, PyObject *kwargs,
-             int recursion_depth, AutoNumber *auto_number);
+             int recursion_depth, AutoNumber *auto_number,
+             PyTaintObject **taint_obj);
 
 
 
@@ -197,6 +198,7 @@ get_integer(const SubString *str)
 {
     Py_ssize_t accumulator = 0;
     Py_ssize_t digitval;
+    Py_ssize_t oldaccumulator;
     STRINGLIB_CHAR *p;
 
     /* empty string is an error */
@@ -208,17 +210,19 @@ get_integer(const SubString *str)
         if (digitval < 0)
             return -1;
         /*
-           Detect possible overflow before it happens:
-
-              accumulator * 10 + digitval > PY_SSIZE_T_MAX if and only if
-              accumulator > (PY_SSIZE_T_MAX - digitval) / 10.
+           This trick was copied from old Unicode format code.  It's cute,
+           but would really suck on an old machine with a slow divide
+           implementation.  Fortunately, in the normal case we do not
+           expect too many digits.
         */
-        if (accumulator > (PY_SSIZE_T_MAX - digitval) / 10) {
+        oldaccumulator = accumulator;
+        accumulator *= 10;
+        if ((accumulator+10)/10 != oldaccumulator+1) {
             PyErr_Format(PyExc_ValueError,
                          "Too many decimal digits in format string");
             return -1;
         }
-        accumulator = accumulator * 10 + digitval;
+        accumulator += digitval;
     }
     return accumulator;
 }
@@ -557,7 +561,8 @@ error:
     appends to the output.
 */
 static int
-render_field(PyObject *fieldobj, SubString *format_spec, OutputString *output)
+render_field(PyObject *fieldobj, SubString *format_spec, OutputString *output,
+             PyTaintObject **taintobj)
 {
     int ok = 0;
     PyObject *result = NULL;
@@ -588,6 +593,9 @@ render_field(PyObject *fieldobj, SubString *format_spec, OutputString *output)
     else if (PyFloat_CheckExact(fieldobj))
         formatter = _PyFloat_FormatAdvanced;
 #endif
+    if (PyTaint_IsTaintable(fieldobj)) {
+        PyTaint_PropagateTo(taintobj, _PyTaint_GetFromObject(fieldobj));
+    }
 
     if (formatter) {
         /* we know exactly which formatter will be called when __format__ is
@@ -882,7 +890,8 @@ static int
 output_markup(SubString *field_name, SubString *format_spec,
               int format_spec_needs_expanding, STRINGLIB_CHAR conversion,
               OutputString *output, PyObject *args, PyObject *kwargs,
-              int recursion_depth, AutoNumber *auto_number)
+              int recursion_depth, AutoNumber *auto_number,
+              PyTaintObject **taint_obj)
 {
     PyObject *tmp = NULL;
     PyObject *fieldobj = NULL;
@@ -909,9 +918,17 @@ output_markup(SubString *field_name, SubString *format_spec,
     /* if needed, recurively compute the format_spec */
     if (format_spec_needs_expanding) {
         tmp = build_string(format_spec, args, kwargs, recursion_depth-1,
-                           auto_number);
+                           auto_number, taint_obj);
         if (tmp == NULL)
             goto done;
+
+        Py_XINCREF(*taint_obj);
+        // build_string will steal reference to *taint_obj, possibly modify it,
+        // and assign to tmp. however, we want to reuse *taint_obj in
+        // render_field, so incref. (Also *taint_obj can not be increfed before
+        // calling build_string, because it may be swapped with a new object)
+
+        assert(_PyTaint_GetFromObject(tmp) == *taint_obj);
 
         /* note that in the case we're expanding the format string,
            tmp must be kept around until after the call to
@@ -923,7 +940,7 @@ output_markup(SubString *field_name, SubString *format_spec,
     else
         actual_format_spec = format_spec;
 
-    if (render_field(fieldobj, actual_format_spec, output) == 0)
+    if (render_field(fieldobj, actual_format_spec, output, taint_obj) == 0)
         goto done;
 
     result = 1;
@@ -943,7 +960,8 @@ done:
 */
 static int
 do_markup(SubString *input, PyObject *args, PyObject *kwargs,
-          OutputString *output, int recursion_depth, AutoNumber *auto_number)
+          OutputString *output, int recursion_depth, AutoNumber *auto_number,
+          PyTaintObject **taint_obj)
 {
     MarkupIterator iter;
     int format_spec_needs_expanding;
@@ -964,7 +982,8 @@ do_markup(SubString *input, PyObject *args, PyObject *kwargs,
         if (field_present)
             if (!output_markup(&field_name, &format_spec,
                                format_spec_needs_expanding, conversion, output,
-                               args, kwargs, recursion_depth, auto_number))
+                               args, kwargs, recursion_depth, auto_number,
+                               taint_obj))
                 return 0;
     }
     return result;
@@ -977,7 +996,8 @@ do_markup(SubString *input, PyObject *args, PyObject *kwargs,
 */
 static PyObject *
 build_string(SubString *input, PyObject *args, PyObject *kwargs,
-             int recursion_depth, AutoNumber *auto_number)
+             int recursion_depth, AutoNumber *auto_number,
+             PyTaintObject **taint_obj)
 {
     OutputString output;
     PyObject *result = NULL;
@@ -1000,7 +1020,7 @@ build_string(SubString *input, PyObject *args, PyObject *kwargs,
         goto done;
 
     if (!do_markup(input, args, kwargs, &output, recursion_depth,
-                   auto_number)) {
+                   auto_number, taint_obj)) {
         goto done;
     }
 
@@ -1012,8 +1032,10 @@ build_string(SubString *input, PyObject *args, PyObject *kwargs,
     /* transfer ownership to result */
     result = output.obj;
     output.obj = NULL;
+    result = PyTaint_AssignToObject(result, *taint_obj);
 
 done:
+    Py_XDECREF(*taint_obj);
     Py_XDECREF(output.obj);
     return result;
 }
@@ -1027,6 +1049,7 @@ static PyObject *
 do_string_format(PyObject *self, PyObject *args, PyObject *kwargs)
 {
     SubString input;
+    PyTaintObject *taint = NULL;
 
     /* PEP 3101 says only 2 levels, so that
        "{0:{1}}".format('abc', 's')            # works
@@ -1038,7 +1061,15 @@ do_string_format(PyObject *self, PyObject *args, PyObject *kwargs)
 
     AutoNumber_Init(&auto_number);
     SubString_init(&input, STRINGLIB_STR(self), STRINGLIB_LEN(self));
-    return build_string(&input, args, kwargs, recursion_depth, &auto_number);
+#if STRINGLIB_IS_UNICODE
+    taint = PyUnicode_GET_MERITS(self);
+#else
+    taint = PyString_GET_MERITS(self);
+#endif
+    Py_XINCREF(taint);
+
+    return build_string(&input, args, kwargs, recursion_depth, &auto_number,
+                        &taint);
 }
 
 

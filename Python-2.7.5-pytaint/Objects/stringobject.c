@@ -20,6 +20,10 @@ static PyStringObject *nullstring;
 
    Another way to look at this is that to say that the actual reference
    count of a string is:  s->ob_refcnt + (s->ob_sstate?2:0)
+
+   Note that only untainted strings can be interned. (Passing a tainted string
+   to `intern` python builtin will cause TypeError, whereas C API Python
+   functions like PyString_InternInPlace will ignore tainted strings).
 */
 static PyObject *interned;
 
@@ -30,6 +34,48 @@ static PyObject *interned;
    3 bytes per string allocation on a typical system.
 */
 #define PyStringObject_SIZE (offsetof(PyStringObject, ob_sval) + 1)
+
+/*
+    Build a string in similar way to PyString_FromStringAndSize without
+    checking if the arguments are valid, also it does not intern short strings.
+*/
+static PyStringObject *
+unsafe_build_string(const char *str, Py_ssize_t size)
+{
+    register PyStringObject *op;
+    op = (PyStringObject *)PyObject_MALLOC(PyStringObject_SIZE + size);
+    if (op == NULL)
+        return (PyStringObject *)PyErr_NoMemory();
+    PyObject_INIT_VAR(op, &PyString_Type, size);
+    op->ob_shash = -1;
+    op->ob_sstate = SSTATE_NOT_INTERNED;
+
+    if (str != NULL)
+        Py_MEMCPY(op->ob_sval, str, size);
+    op->ob_sval[size] = '\0';
+    op->ob_merits = NULL;
+
+    return op;
+}
+
+/*
+    Utility for building strings, checks if string size is valid.
+*/
+static int
+check_string_size(Py_ssize_t size)
+{
+    if (size < 0) {
+        PyErr_SetString(PyExc_SystemError,
+            "Negative size passed to PyString_FromStringAndSize");
+        return -1;
+    }
+
+    if (size > PY_SSIZE_T_MAX - PyStringObject_SIZE) {
+        PyErr_SetString(PyExc_OverflowError, "string is too large");
+        return -1;
+    }
+    return 1;
+}
 
 /*
    For PyString_FromString(), the parameter `str' points to a null-terminated
@@ -46,6 +92,12 @@ static PyObject *interned;
    PyString object must be treated as immutable and you must not fill in nor
    alter the data yourself, since the strings may be shared.
 
+   For PyString_FromStringAndSizeNoIntern(), the parameters `str' and `size'
+   work the same as in PyString_FromStringAndSize(), however the returned
+   string object will not be interned. This is useful for string methods when
+   merits of result is not yet known, yet it is certain that the result will
+   be tainted (so it cannot be interned).
+
    The PyObject member `op->ob_size', which denotes the number of "extra
    items" in a variable-size object, will contain the number of bytes
    allocated for string data, not counting the null terminating character.
@@ -57,11 +109,7 @@ PyObject *
 PyString_FromStringAndSize(const char *str, Py_ssize_t size)
 {
     register PyStringObject *op;
-    if (size < 0) {
-        PyErr_SetString(PyExc_SystemError,
-            "Negative size passed to PyString_FromStringAndSize");
-        return NULL;
-    }
+
     if (size == 0 && (op = nullstring) != NULL) {
 #ifdef COUNT_ALLOCS
         null_strings++;
@@ -79,21 +127,12 @@ PyString_FromStringAndSize(const char *str, Py_ssize_t size)
         return (PyObject *)op;
     }
 
-    if (size > PY_SSIZE_T_MAX - PyStringObject_SIZE) {
-        PyErr_SetString(PyExc_OverflowError, "string is too large");
+    if (check_string_size(size) == -1)
         return NULL;
-    }
 
-    /* Inline PyObject_NewVar */
-    op = (PyStringObject *)PyObject_MALLOC(PyStringObject_SIZE + size);
+    op = unsafe_build_string(str, size);
     if (op == NULL)
-        return PyErr_NoMemory();
-    PyObject_INIT_VAR(op, &PyString_Type, size);
-    op->ob_shash = -1;
-    op->ob_sstate = SSTATE_NOT_INTERNED;
-    if (str != NULL)
-        Py_MEMCPY(op->ob_sval, str, size);
-    op->ob_sval[size] = '\0';
+        return NULL;
     /* share short strings */
     if (size == 0) {
         PyObject *t = (PyObject *)op;
@@ -108,6 +147,7 @@ PyString_FromStringAndSize(const char *str, Py_ssize_t size)
         characters[*str & UCHAR_MAX] = op;
         Py_INCREF(op);
     }
+    assert(!PyString_CHECK_TAINTED(op));
     return (PyObject *) op;
 }
 
@@ -138,15 +178,11 @@ PyString_FromString(const char *str)
         Py_INCREF(op);
         return (PyObject *)op;
     }
-
-    /* Inline PyObject_NewVar */
-    op = (PyStringObject *)PyObject_MALLOC(PyStringObject_SIZE + size);
+    if (check_string_size(size) == -1)
+        return NULL;
+    op = unsafe_build_string(str, size);
     if (op == NULL)
         return PyErr_NoMemory();
-    PyObject_INIT_VAR(op, &PyString_Type, size);
-    op->ob_shash = -1;
-    op->ob_sstate = SSTATE_NOT_INTERNED;
-    Py_MEMCPY(op->ob_sval, str, size+1);
     /* share short strings */
     if (size == 0) {
         PyObject *t = (PyObject *)op;
@@ -161,7 +197,139 @@ PyString_FromString(const char *str)
         characters[*str & UCHAR_MAX] = op;
         Py_INCREF(op);
     }
+
     return (PyObject *) op;
+}
+
+PyObject *
+PyString_FromStringAndSizeNoIntern(const char *str, Py_ssize_t size)
+{
+    register PyStringObject *op;
+
+    if (check_string_size(size) == -1)
+        return NULL;
+
+    op = unsafe_build_string(str, size);
+    if (op == NULL)
+        return NULL;
+
+    op->ob_merits = NULL;
+
+    return (PyObject *) op;
+}
+
+/*
+   PyString_FromStringAndSizeSameMerits works the same as
+   PyString_FromStringAndSize when NULL merits are passed. If the merits are
+   non-NULL, PyString_FromStringAndSizeSameMerits will create a string object
+   that references those merits. This function does not steal reference; upon
+   sucessful creation of new object refcount of passed merits will be
+   increased.
+*/
+PyObject *
+PyString_FromStringAndSizeSameMerits(const char *str, Py_ssize_t size,
+                                     PyTaintObject *merits)
+{
+    register PyObject *op;
+
+    if (merits == NULL) {
+        op = PyString_FromStringAndSize(str, size);
+    } else {
+        op = PyString_FromStringAndSizeNoIntern(str, size);
+    }
+
+    if (op == NULL)
+        return NULL;
+
+    if (merits != NULL)
+        PyString_ASSIGN_MERITS(op, merits);
+
+    return op;
+}
+
+/*
+   Based on taint propagation semantics, propagate taint between a and b and
+   store result in the result. Returns 1 on success, -1 on failure. The
+   target's ob_merits will be replaced by a new object, so this function is
+   safe to use even if they're shared with another string.
+*/
+int _PyString_BinaryTaintPropagateInPlace(register PyStringObject *result,
+                                          register PyStringObject *a,
+                                          register PyStringObject *b)
+{
+    return PyTaint_PropagationResult(&(result->ob_merits),
+                                     PyString_GET_MERITS(a),
+                                     PyString_GET_MERITS(b));
+}
+
+/*
+    Based on taint propagation rules for each merit, propagate merits between
+    source and target (modifying target's merits). Returns 1 on success, -1 on
+    failure. The target's ob_merits will be replaced by a new object, so this
+    function is safe to use even if they're shared with another string.
+*/
+int
+_PyString_PropagateTaintInPlace(register PyStringObject *target,
+                                register PyStringObject *source)
+{
+    PyTaintObject *result = NULL;
+    if (PyTaint_PropagationResult(&result, PyString_GET_MERITS(target),
+                                  PyString_GET_MERITS(source)) == -1)
+        return -1;
+
+    Py_XDECREF(target->ob_merits);
+    PyString_ASSIGN_MERITS(target, result);
+    return 1;
+}
+
+/* PyString_AssignTaint will return string with same contents as str and taint
+   value taint. The return value may be either the same object as str or a new
+   stringobject.
+
+   When sucessful, steals reference to str. Returns NULL on failure. */
+
+PyObject*
+PyString_AssignTaint(PyStringObject *str, PyTaintObject *taint) {
+    PyObject *result;
+
+    if (!PyString_Check(str)) {
+        PyErr_Format(PyExc_TypeError,
+                     "Trying to assign taint to object of type %.200s\
+                      (expected string).", Py_TYPE(str)->tp_name);
+        return NULL;
+    }
+
+    if (PyString_GET_MERITS(str) == taint)
+        return (PyObject*)str;
+
+    if (str->ob_refcnt == 1 && !PyString_CHECK_INTERNED(str)) {
+        result = (PyObject*)str;
+        Py_XDECREF(PyString_GET_MERITS(result));
+    } else {
+        result = PyString_FromStringAndSizeNoIntern(PyString_AS_STRING(str),
+                                                    PyString_GET_SIZE(str));
+        if (result == NULL)
+            return result;
+        Py_DECREF(str);
+    }
+    PyString_ASSIGN_MERITS(result, taint);
+
+    return result;
+}
+
+int
+_PyString_CopyTaint(register PyStringObject *target,
+                    register PyStringObject *source)
+{
+    if (PyString_CHECK_INTERNED(target)) {
+      PyErr_SetString(PyExc_ValueError,
+                      "Attempted tainting of interned string.");
+      return -1;
+    }
+
+    Py_XDECREF(target->ob_merits);
+    PyString_ASSIGN_MERITS(target, source->ob_merits);
+    return 1;
 }
 
 PyObject *
@@ -453,7 +621,7 @@ PyObject *PyString_AsDecodedObject(PyObject *str,
     if (v == NULL)
         goto onError;
 
-    return v;
+    return PyTaint_AssignToObject(v, PyString_GET_MERITS(str));
 
  onError:
     return NULL;
@@ -533,7 +701,7 @@ PyObject *PyString_AsEncodedObject(PyObject *str,
     if (v == NULL)
         goto onError;
 
-    return v;
+    return PyTaint_AssignToObject(v, PyString_GET_MERITS(str));
 
  onError:
     return NULL;
@@ -594,6 +762,7 @@ string_dealloc(PyObject *op)
         default:
             Py_FatalError("Inconsistent interned string state.");
     }
+    Py_XDECREF(((PyStringObject*)op)->ob_merits);
     Py_TYPE(op)->tp_free(op);
 }
 
@@ -1066,6 +1235,13 @@ string_concat(register PyStringObject *a, register PyObject *bb)
     Py_MEMCPY(op->ob_sval, a->ob_sval, Py_SIZE(a));
     Py_MEMCPY(op->ob_sval + Py_SIZE(a), b->ob_sval, Py_SIZE(b));
     op->ob_sval[size] = '\0';
+    op->ob_merits = NULL;
+
+    if (PyTaint_PropagationResult(&PyString_GET_MERITS(op),
+                                  PyString_GET_MERITS(a),
+                                  PyString_GET_MERITS(b)) == -1)
+        return NULL;
+
     return (PyObject *) op;
 #undef b
 }
@@ -1106,6 +1282,13 @@ string_repeat(register PyStringObject *a, register Py_ssize_t n)
     op->ob_shash = -1;
     op->ob_sstate = SSTATE_NOT_INTERNED;
     op->ob_sval[size] = '\0';
+    op->ob_merits = NULL;
+
+    if (_PyString_CopyTaint(op, a) == -1) {
+        Py_DECREF(op);
+        return NULL;
+    }
+
     if (Py_SIZE(a) == 1 && n > 0) {
         memset(op->ob_sval, a->ob_sval[0] , n);
         return (PyObject *) op;
@@ -1143,7 +1326,9 @@ string_slice(register PyStringObject *a, register Py_ssize_t i,
     }
     if (j < i)
         j = i;
-    return PyString_FromStringAndSize(a->ob_sval + i, j-i);
+    return PyString_FromStringAndSizeSameMerits(a->ob_sval + i,
+                                                j - i,
+                                                a->ob_merits);
 }
 
 static int
@@ -1175,14 +1360,26 @@ string_item(PyStringObject *a, register Py_ssize_t i)
         return NULL;
     }
     pchar = a->ob_sval[i];
-    v = (PyObject *)characters[pchar & UCHAR_MAX];
-    if (v == NULL)
-        v = PyString_FromStringAndSize(&pchar, 1);
-    else {
+    if (a->ob_merits == NULL) {
+        // string is untainted - pick an interned character
+        v = (PyObject *)characters[pchar & UCHAR_MAX];
+        if (v == NULL)
+            v = PyString_FromStringAndSize(&pchar, 1);
+        else {
 #ifdef COUNT_ALLOCS
-        one_strings++;
+            one_strings++;
 #endif
-        Py_INCREF(v);
+            Py_INCREF(v);
+        }
+    } else {
+        // tainted string - create a new one character string
+        v = PyString_FromStringAndSizeNoIntern(&pchar, 1);
+        if (v == NULL)
+            return NULL;
+        if (_PyString_CopyTaint((PyStringObject*)v, a) == -1) {
+            Py_DECREF(v);
+            return NULL;
+        }
     }
     return v;
 }
@@ -1317,7 +1514,8 @@ string_subscript(PyStringObject* self, PyObject* item)
         }
 
         if (slicelength <= 0) {
-            return PyString_FromStringAndSize("", 0);
+            return PyString_FromStringAndSizeSameMerits("", 0,
+                                                        self->ob_merits);
         }
         else if (start == 0 && step == 1 &&
                  slicelength == PyString_GET_SIZE(self) &&
@@ -1326,9 +1524,9 @@ string_subscript(PyStringObject* self, PyObject* item)
             return (PyObject *)self;
         }
         else if (step == 1) {
-            return PyString_FromStringAndSize(
-                PyString_AS_STRING(self) + start,
-                slicelength);
+            return PyString_FromStringAndSizeSameMerits(
+                          PyString_AS_STRING(self) + start, slicelength,
+                          PyString_GET_MERITS(self));
         }
         else {
             source_buf = PyString_AsString((PyObject*)self);
@@ -1341,8 +1539,8 @@ string_subscript(PyStringObject* self, PyObject* item)
                 result_buf[i] = source_buf[cur];
             }
 
-            result = PyString_FromStringAndSize(result_buf,
-                                                slicelength);
+            result = PyString_FromStringAndSizeSameMerits(
+                          result_buf, slicelength, PyString_GET_MERITS(self));
             PyMem_Free(result_buf);
             return result;
         }
@@ -1429,7 +1627,141 @@ static PyBufferProcs string_as_buffer = {
     0, /* XXX */
 };
 
+PyDoc_STRVAR(istainted__doc__,
+"S.istainted() -> bool\n\
+\n\
+Return True if S is tainted, False otherwise.");
 
+static PyObject *
+string_istainted(PyStringObject *self)
+{
+    long taint_val = (long)(self->ob_merits != NULL);
+    return PyBool_FromLong(taint_val);
+}
+
+PyDoc_STRVAR(isclean__doc__,
+"S.isclean([merit]) -> bool\n\
+\n\
+If no merit is specified return False if S is tainted, True otherwise. If a\n\
+merit is specified return False when S is tainted and doesn't have given\n\
+merit, True otherwise.");
+
+static PyObject *
+string_isclean(PyStringObject *self, PyObject *args)
+{
+    PyObject *merit = Py_None;
+    if (!PyArg_ParseTuple(args, "|O:isclean", &merit))
+        return NULL;
+
+    if (self->ob_merits == NULL) {
+        Py_RETURN_TRUE;
+    }
+
+    if (merit == Py_None) {
+        Py_RETURN_FALSE;
+    }
+
+    if (!PyObject_HasAttrString(merit, "propagation")) {
+        PyErr_SetString(PyExc_TypeError,
+                        "Invalid merit object passed.");
+        return NULL;
+    }
+
+    switch (PySequence_Contains((PyObject*)PyString_GET_MERITS(self),
+                                merit)) {
+        case -1:
+            return NULL;
+        case 1:
+            Py_RETURN_TRUE;
+    }
+    Py_RETURN_FALSE;
+}
+
+PyDoc_STRVAR(taint__doc__,
+"S.taint() -> str\n\
+\n\
+Return a tainted copy of S without any merits.");
+
+static PyObject *
+string_taint(PyStringObject *self)
+{
+    PyTaintObject *taint = PyTaint_EmptyMerits();
+    if (taint == NULL)
+        return NULL;
+
+    return PyString_FromStringAndSizeSameMerits(PyString_AS_STRING(self),
+                                                PyTuple_GET_SIZE(self),
+                                                taint);
+}
+
+PyDoc_STRVAR(cleanfor__doc__,
+"S._cleanfor(M) -> string\n\
+\n\
+Return a tainted copy of S which has merit M. All other merits of S are also\n\
+copied to return value.");
+
+static PyObject *
+string_cleanfor(PyStringObject *self, PyObject *merit)
+{
+    PyStringObject *newobj;
+    PyTaintObject *taint, *new_taint;
+
+    if (_PyTaint_ValidMerit(merit) == -1)
+        return NULL;
+
+    if (PyString_CHECK_TAINTED(self)) {
+        taint = PyString_GET_MERITS(self);
+        Py_INCREF(taint);
+    } else {
+        taint = PyTaint_EmptyMerits();
+        if (taint == NULL)
+            return NULL;
+    }
+
+    new_taint = _PyTaint_AddMerit(taint, merit);
+    Py_DECREF(taint);
+    if (new_taint == NULL)
+        return NULL;
+    newobj = (PyStringObject*)PyString_FromStringAndSizeSameMerits(
+                                PyString_AS_STRING(self),
+                                PyString_GET_SIZE(self),
+                                new_taint);
+
+
+    if (newobj == NULL)
+        return NULL;
+    Py_DECREF(new_taint);
+    return (PyObject *)newobj;
+}
+
+PyDoc_STRVAR(listmerits__doc__,
+"S._merits() -> list of merits\n\
+\n\
+For tainted string S, return its set of merits. If S is untainted return\n\
+None.");
+
+static PyObject*
+string_listmerits(PyStringObject *self)
+{
+    if (self->ob_merits == NULL) {
+        Py_RETURN_NONE;
+    }
+
+    return PySet_New((PyObject*)PyString_GET_MERITS(self));
+}
+
+PyDoc_STRVAR(propagate__doc__,
+"S._propagate(T) -> string\n\
+\n\
+Return a copy of S, which has the same merits as T.");
+
+static PyObject *
+string_propagate(PyStringObject *self, PyStringObject *source)
+{
+    return PyString_FromStringAndSizeSameMerits(PyString_AS_STRING(self),
+                                                PyString_GET_SIZE(self),
+                                                PyString_GET_MERITS(source));
+}
 
 #define LEFTSTRIP 0
 #define RIGHTSTRIP 1
@@ -1456,25 +1788,48 @@ string_split(PyStringObject *self, PyObject *args)
     Py_ssize_t maxsplit = -1;
     const char *s = PyString_AS_STRING(self), *sub;
     PyObject *subobj = Py_None;
+    PyObject *result;
+    PyTaintObject *taintobj = NULL;
 
     if (!PyArg_ParseTuple(args, "|On:split", &subobj, &maxsplit))
         return NULL;
     if (maxsplit < 0)
         maxsplit = PY_SSIZE_T_MAX;
-    if (subobj == Py_None)
-        return stringlib_split_whitespace((PyObject*) self, s, len, maxsplit);
-    if (PyString_Check(subobj)) {
-        sub = PyString_AS_STRING(subobj);
-        n = PyString_GET_SIZE(subobj);
-    }
+    if (subobj == Py_None) {
+        result = stringlib_split_whitespace((PyObject*) self, s, len, maxsplit);
+        if (result == NULL)
+            return NULL;
+        taintobj = (PyTaintObject*)PyString_GET_MERITS(self);
+        Py_XINCREF(taintobj);
+    } else {
+        if (PyString_Check(subobj)) {
+            sub = PyString_AS_STRING(subobj);
+            n = PyString_GET_SIZE(subobj);
+        }
 #ifdef Py_USING_UNICODE
-    else if (PyUnicode_Check(subobj))
-        return PyUnicode_Split((PyObject *)self, subobj, maxsplit);
+        else if (PyUnicode_Check(subobj))
+            return PyUnicode_Split((PyObject *)self, subobj, maxsplit);
 #endif
-    else if (PyObject_AsCharBuffer(subobj, &sub, &n))
-        return NULL;
+        else if (PyObject_AsCharBuffer(subobj, &sub, &n))
+            return NULL;
+        result = stringlib_split((PyObject*) self, s, len, sub, n, maxsplit);
+        if (result == NULL)
+            return NULL;
+        if (PyTaint_PropagationResult(&taintobj, PyString_GET_MERITS(self),
+                                      PyString_GET_MERITS(subobj)) == -1)
+            goto onError;
+    }
 
-    return stringlib_split((PyObject*) self, s, len, sub, n, maxsplit);
+    if (_PyTaint_TaintStringListItems(result, taintobj) == -1)
+        goto onError;
+
+    Py_XDECREF(taintobj);
+    return result;
+
+onError:
+    Py_XDECREF(taintobj);
+    Py_DECREF(result);
+    return NULL;
 }
 
 PyDoc_STRVAR(partition__doc__,
@@ -1489,6 +1844,7 @@ string_partition(PyStringObject *self, PyObject *sep_obj)
 {
     const char *sep;
     Py_ssize_t sep_len;
+    PyTaintObject* taintobj = NULL;
 
     if (PyString_Check(sep_obj)) {
         sep = PyString_AS_STRING(sep_obj);
@@ -1501,11 +1857,35 @@ string_partition(PyStringObject *self, PyObject *sep_obj)
     else if (PyObject_AsCharBuffer(sep_obj, &sep, &sep_len))
         return NULL;
 
-    return stringlib_partition(
+    PyObject* result = stringlib_partition(
         (PyObject*) self,
         PyString_AS_STRING(self), PyString_GET_SIZE(self),
         sep_obj, sep, sep_len
         );
+
+    if (result == NULL)
+        return NULL;
+
+    if (!PyString_CHECK_TAINTED(self) && !PyString_CHECK_TAINTED(sep_obj))
+        return result;
+
+    if (-1 == PyTaint_PropagationResult(&taintobj,
+                                        PyString_GET_MERITS(self),
+                                        PyString_GET_MERITS(sep_obj)))
+        goto onError;
+
+    result = _PyTaint_TaintStringTupleItems(result, taintobj);
+
+    if (result == NULL)
+        goto onError;
+
+    Py_XDECREF(taintobj);
+    return result;
+
+onError:
+    Py_XDECREF(taintobj);
+    Py_DECREF(result);
+    return NULL;
 }
 
 PyDoc_STRVAR(rpartition__doc__,
@@ -1520,6 +1900,7 @@ string_rpartition(PyStringObject *self, PyObject *sep_obj)
 {
     const char *sep;
     Py_ssize_t sep_len;
+    PyTaintObject* taintobj = NULL;
 
     if (PyString_Check(sep_obj)) {
         sep = PyString_AS_STRING(sep_obj);
@@ -1532,11 +1913,35 @@ string_rpartition(PyStringObject *self, PyObject *sep_obj)
     else if (PyObject_AsCharBuffer(sep_obj, &sep, &sep_len))
         return NULL;
 
-    return stringlib_rpartition(
+    PyObject* result = stringlib_rpartition(
         (PyObject*) self,
         PyString_AS_STRING(self), PyString_GET_SIZE(self),
         sep_obj, sep, sep_len
         );
+
+    if (result == NULL)
+        return NULL;
+
+    if (!PyString_CHECK_TAINTED(self) && !PyString_CHECK_TAINTED(sep_obj))
+        return result;
+
+    if (-1 == PyTaint_PropagationResult(&taintobj,
+                                        PyString_GET_MERITS(self),
+                                        PyString_GET_MERITS(sep_obj)))
+        goto onError;
+
+    result = _PyTaint_TaintStringTupleItems(result, taintobj);
+
+    if (result == NULL)
+        goto onError;
+
+    Py_XDECREF(taintobj);
+    return result;
+
+onError:
+    Py_XDECREF(taintobj);
+    Py_DECREF(result);
+    return NULL;
 }
 
 PyDoc_STRVAR(rsplit__doc__,
@@ -1555,25 +1960,50 @@ string_rsplit(PyStringObject *self, PyObject *args)
     Py_ssize_t maxsplit = -1;
     const char *s = PyString_AS_STRING(self), *sub;
     PyObject *subobj = Py_None;
+    PyObject *result;
+    PyTaintObject *taintobj = NULL;
 
     if (!PyArg_ParseTuple(args, "|On:rsplit", &subobj, &maxsplit))
         return NULL;
     if (maxsplit < 0)
         maxsplit = PY_SSIZE_T_MAX;
-    if (subobj == Py_None)
-        return stringlib_rsplit_whitespace((PyObject*) self, s, len, maxsplit);
-    if (PyString_Check(subobj)) {
-        sub = PyString_AS_STRING(subobj);
-        n = PyString_GET_SIZE(subobj);
-    }
+    if (subobj == Py_None) {
+        result = stringlib_rsplit_whitespace((PyObject*) self, s, len, maxsplit);
+        if (result == NULL)
+            return NULL;
+        taintobj = (PyTaintObject*)PyString_GET_MERITS(self);
+        Py_XINCREF(taintobj);
+    } else {
+        if (PyString_Check(subobj)) {
+            sub = PyString_AS_STRING(subobj);
+            n = PyString_GET_SIZE(subobj);
+        }
 #ifdef Py_USING_UNICODE
-    else if (PyUnicode_Check(subobj))
-        return PyUnicode_RSplit((PyObject *)self, subobj, maxsplit);
+        else if (PyUnicode_Check(subobj))
+            return PyUnicode_RSplit((PyObject *)self, subobj, maxsplit);
 #endif
-    else if (PyObject_AsCharBuffer(subobj, &sub, &n))
-        return NULL;
+        else if (PyObject_AsCharBuffer(subobj, &sub, &n))
+            return NULL;
+        result = stringlib_rsplit((PyObject*) self, s, len, sub, n, maxsplit);
+        if (result == NULL)
+            return NULL;
 
-    return stringlib_rsplit((PyObject*) self, s, len, sub, n, maxsplit);
+        if (-1 == PyTaint_PropagationResult(&taintobj,
+                                            PyString_GET_MERITS(self),
+                                            PyString_GET_MERITS(subobj)))
+            goto onError;
+    }
+
+    if (_PyTaint_TaintStringListItems(result, taintobj) == -1)
+        goto onError;
+
+    Py_XDECREF(taintobj);
+    return result;
+
+onError:
+    Py_XDECREF(taintobj);
+    Py_DECREF(result);
+    return NULL;
 }
 
 
@@ -1594,6 +2024,7 @@ string_join(PyStringObject *self, PyObject *orig)
     size_t sz = 0;
     Py_ssize_t i;
     PyObject *seq, *item;
+    PyTaintObject *taint = NULL;
 
     seq = PySequence_Fast(orig, "");
     if (seq == NULL) {
@@ -1601,16 +2032,35 @@ string_join(PyStringObject *self, PyObject *orig)
     }
 
     seqlen = PySequence_Size(seq);
+    taint = PyString_GET_MERITS(self);
+    Py_XINCREF(taint);
+
     if (seqlen == 0) {
-        Py_DECREF(seq);
-        return PyString_FromString("");
+        res = PyString_FromStringAndSizeSameMerits("", 0, taint);
+        goto done;
     }
+
     if (seqlen == 1) {
         item = PySequence_Fast_GET_ITEM(seq, 0);
         if (PyString_CheckExact(item) || PyUnicode_CheckExact(item)) {
-            Py_INCREF(item);
-            Py_DECREF(seq);
-            return item;
+            if (PyTaint_PropagateTo(&taint, _PyTaint_GetFromObject(item)) == -1)
+                goto onError;
+            if (PyTaint_IS_CLEAN(taint)) {
+                Py_INCREF(item);
+                Py_DECREF(seq);
+                return item;
+            }
+            if (PyString_CheckExact(item))
+                res = PyString_FromStringAndSizeSameMerits(
+                                        PyString_AS_STRING(item),
+                                        PyString_GET_SIZE(item),
+                                        taint);
+            else // PyUnicode_CheckExact(item) is true
+                res = PyUnicode_FromUnicodeSameMerits(
+                                        PyUnicode_AS_UNICODE(item),
+                                        PyUnicode_GET_SIZE(item),
+                                        taint);
+            goto done;
         }
     }
 
@@ -1641,8 +2091,7 @@ string_join(PyStringObject *self, PyObject *orig)
                          "sequence item %zd: expected string,"
                          " %.80s found",
                          i, Py_TYPE(item)->tp_name);
-            Py_DECREF(seq);
-            return NULL;
+            goto onError;
         }
         sz += PyString_GET_SIZE(item);
         if (i != 0)
@@ -1650,17 +2099,18 @@ string_join(PyStringObject *self, PyObject *orig)
         if (sz < old_sz || sz > PY_SSIZE_T_MAX) {
             PyErr_SetString(PyExc_OverflowError,
                 "join() result is too long for a Python string");
-            Py_DECREF(seq);
-            return NULL;
+            goto onError;
+        }
+        if (PyTaint_PropagateTo(&taint, PyString_GET_MERITS(item)) == -1) {
+            Py_DECREF(item);
+            goto onError;
         }
     }
 
-    /* Allocate result space. */
-    res = PyString_FromStringAndSize((char*)NULL, sz);
-    if (res == NULL) {
-        Py_DECREF(seq);
-        return NULL;
-    }
+    res = PyString_FromStringAndSizeSameMerits((char*)NULL, sz, taint);
+
+    if (res == NULL)
+        goto onError;
 
     /* Catenate everything. */
     p = PyString_AS_STRING(res);
@@ -1676,8 +2126,16 @@ string_join(PyStringObject *self, PyObject *orig)
         }
     }
 
+done:
     Py_DECREF(seq);
+    Py_XDECREF(taint);
     return res;
+
+onError:
+    Py_XDECREF(res);
+    Py_XDECREF(taint);
+    Py_DECREF(seq);
+    return NULL;
 }
 
 PyObject *
@@ -1826,6 +2284,7 @@ do_xstrip(PyStringObject *self, int striptype, PyObject *sepobj)
     char *sep = PyString_AS_STRING(sepobj);
     Py_ssize_t seplen = PyString_GET_SIZE(sepobj);
     Py_ssize_t i, j;
+    PyTaintObject *taint = NULL;
 
     i = 0;
     if (striptype != RIGHTSTRIP) {
@@ -1842,12 +2301,16 @@ do_xstrip(PyStringObject *self, int striptype, PyObject *sepobj)
         j++;
     }
 
-    if (i == 0 && j == len && PyString_CheckExact(self)) {
+    if (PyTaint_PropagationResult(&taint, PyString_GET_MERITS(self),
+                                  PyString_GET_MERITS(sepobj)) == -1)
+        return NULL;
+
+    if (i == 0 && j == len && PyString_CheckExact(self) && \
+        taint == PyString_GET_MERITS(self)) {
         Py_INCREF(self);
         return (PyObject*)self;
     }
-    else
-        return PyString_FromStringAndSize(s+i, j-i);
+    return PyString_FromStringAndSizeSameMerits(s+i, j-i, taint);
 }
 
 
@@ -1877,7 +2340,8 @@ do_strip(PyStringObject *self, int striptype)
         return (PyObject*)self;
     }
     else
-        return PyString_FromStringAndSize(s+i, j-i);
+        return PyString_FromStringAndSizeSameMerits(s+i, j-i,
+                                                    PyString_GET_MERITS(self));
 }
 
 
@@ -1987,7 +2451,9 @@ string_lower(PyStringObject *self)
     Py_ssize_t i, n = PyString_GET_SIZE(self);
     PyObject *newobj;
 
-    newobj = PyString_FromStringAndSize(NULL, n);
+    newobj = PyString_FromStringAndSizeSameMerits(NULL, n,
+                                                  PyString_GET_MERITS(self));
+
     if (!newobj)
         return NULL;
 
@@ -2020,7 +2486,9 @@ string_upper(PyStringObject *self)
     Py_ssize_t i, n = PyString_GET_SIZE(self);
     PyObject *newobj;
 
-    newobj = PyString_FromStringAndSize(NULL, n);
+    newobj = PyString_FromStringAndSizeSameMerits(NULL, n,
+                                                  PyString_GET_MERITS(self));
+
     if (!newobj)
         return NULL;
 
@@ -2051,7 +2519,9 @@ string_title(PyStringObject *self)
     int previous_is_cased = 0;
     PyObject *newobj;
 
-    newobj = PyString_FromStringAndSize(NULL, n);
+    newobj = PyString_FromStringAndSizeSameMerits(NULL, n,
+                                                  PyString_GET_MERITS(self));
+
     if (newobj == NULL)
         return NULL;
     s_new = PyString_AsString(newobj);
@@ -2085,7 +2555,9 @@ string_capitalize(PyStringObject *self)
     Py_ssize_t i, n = PyString_GET_SIZE(self);
     PyObject *newobj;
 
-    newobj = PyString_FromStringAndSize(NULL, n);
+    newobj = PyString_FromStringAndSizeSameMerits(NULL, n,
+                                                  PyString_GET_MERITS(self));
+
     if (newobj == NULL)
         return NULL;
     s_new = PyString_AsString(newobj);
@@ -2164,7 +2636,8 @@ string_swapcase(PyStringObject *self)
     Py_ssize_t i, n = PyString_GET_SIZE(self);
     PyObject *newobj;
 
-    newobj = PyString_FromStringAndSize(NULL, n);
+    newobj = PyString_FromStringAndSizeSameMerits(NULL, n,
+                                                  PyString_GET_MERITS(self));
     if (newobj == NULL)
         return NULL;
     s_new = PyString_AsString(newobj);
@@ -2206,14 +2679,19 @@ string_translate(PyStringObject *self, PyObject *args)
     PyObject *result;
     int trans_table[256];
     PyObject *tableobj, *delobj = NULL;
+    PyTaintObject *taint = NULL;
 
     if (!PyArg_UnpackTuple(args, "translate", 1, 2,
                           &tableobj, &delobj))
         return NULL;
 
+    taint = PyString_GET_MERITS(self);
+    Py_XINCREF(taint);
+
     if (PyString_Check(tableobj)) {
         table = PyString_AS_STRING(tableobj);
         tablen = PyString_GET_SIZE(tableobj);
+        PyTaint_PropagateTo(&taint, PyString_GET_MERITS(tableobj));
     }
     else if (tableobj == Py_None) {
         table = NULL;
@@ -2245,6 +2723,7 @@ string_translate(PyStringObject *self, PyObject *args)
         if (PyString_Check(delobj)) {
             del_table = PyString_AS_STRING(delobj);
             dellen = PyString_GET_SIZE(delobj);
+            PyTaint_PropagateTo(&taint, PyString_GET_MERITS(delobj));
         }
 #ifdef Py_USING_UNICODE
         else if (PyUnicode_Check(delobj)) {
@@ -2264,7 +2743,7 @@ string_translate(PyStringObject *self, PyObject *args)
     inlen = PyString_GET_SIZE(input_obj);
     result = PyString_FromStringAndSize((char *)NULL, inlen);
     if (result == NULL)
-        return NULL;
+        goto error;
     output_start = output = PyString_AsString(result);
     input = PyString_AS_STRING(input_obj);
 
@@ -2276,10 +2755,8 @@ string_translate(PyStringObject *self, PyObject *args)
                 changed = 1;
         }
         if (changed || !PyString_CheckExact(input_obj))
-            return result;
-        Py_DECREF(result);
-        Py_INCREF(input_obj);
-        return input_obj;
+            goto done;
+        goto nochanges; //return tainted input_obj
     }
 
     if (table == NULL) {
@@ -2301,14 +2778,26 @@ string_translate(PyStringObject *self, PyObject *args)
         changed = 1;
     }
     if (!changed && PyString_CheckExact(input_obj)) {
-        Py_DECREF(result);
-        Py_INCREF(input_obj);
-        return input_obj;
+        goto nochanges; //return tainted input_obj
     }
     /* Fix the size of the resulting string */
     if (inlen > 0 && _PyString_Resize(&result, output - output_start))
-        return NULL;
+        goto error;
+    goto done;
+
+  nochanges: //return tainted input_obj
+    Py_DECREF(result);
+    Py_INCREF(input_obj);
+    result = input_obj;
+
+  done:
+    result = PyString_AssignTaint((PyStringObject*)result, taint);
+    Py_XDECREF(taint);
     return result;
+
+  error:
+    Py_XDECREF(taint);
+    return NULL;
 }
 
 
@@ -2820,40 +3309,65 @@ static PyObject *
 string_replace(PyStringObject *self, PyObject *args)
 {
     Py_ssize_t count = -1;
-    PyObject *from, *to;
+    PyObject *from, *to, *result;
     const char *from_s, *to_s;
     Py_ssize_t from_len, to_len;
+    PyTaintObject *taint;
 
     if (!PyArg_ParseTuple(args, "OO|n:replace", &from, &to, &count))
         return NULL;
 
+    taint = PyString_GET_MERITS(self);
+
     if (PyString_Check(from)) {
         from_s = PyString_AS_STRING(from);
         from_len = PyString_GET_SIZE(from);
+        if (PyTaint_PropagateTo(&taint, PyString_GET_MERITS(from)) == -1) {
+            goto onError;
+        }
     }
 #ifdef Py_USING_UNICODE
-    if (PyUnicode_Check(from))
+    if (PyUnicode_Check(from)) {
+        Py_XDECREF(taint);
         return PyUnicode_Replace((PyObject *)self,
                                  from, to, count);
+    }
 #endif
-    else if (PyObject_AsCharBuffer(from, &from_s, &from_len))
-        return NULL;
+    else if (PyObject_AsCharBuffer(from, &from_s, &from_len)) {
+        goto onError;
+    }
 
     if (PyString_Check(to)) {
         to_s = PyString_AS_STRING(to);
         to_len = PyString_GET_SIZE(to);
+        if (PyTaint_PropagateTo(&taint, PyString_GET_MERITS(to)) == -1) {
+            goto onError;
+        }
     }
 #ifdef Py_USING_UNICODE
-    else if (PyUnicode_Check(to))
+    else if (PyUnicode_Check(to)) {
+        Py_XDECREF(taint);
         return PyUnicode_Replace((PyObject *)self,
                                  from, to, count);
+    }
 #endif
-    else if (PyObject_AsCharBuffer(to, &to_s, &to_len))
-        return NULL;
+    else if (PyObject_AsCharBuffer(to, &to_s, &to_len)) {
+        goto onError;
+    }
 
-    return (PyObject *)replace((PyStringObject *) self,
+    result = (PyObject *)replace((PyStringObject *) self,
                                from_s, from_len,
                                to_s, to_len, count);
+    if (result == NULL)
+        goto onError;
+
+    result = PyString_AssignTaint((PyStringObject*)result, taint);
+    Py_XDECREF(taint);
+    return result;
+
+  onError:
+    Py_XDECREF(taint);
+    return NULL;
 }
 
 /** End DALKE **/
@@ -3117,7 +3631,9 @@ string_expandtabs(PyStringObject *self, PyObject *args)
         goto overflow1;
 
     /* Second pass: create output string and fill it */
-    u = PyString_FromStringAndSize(NULL, i + j);
+    u = PyString_FromStringAndSizeSameMerits(NULL, i + j,
+                                             PyString_GET_MERITS(self));
+
     if (!u)
         return NULL;
 
@@ -3170,8 +3686,7 @@ pad(PyStringObject *self, Py_ssize_t left, Py_ssize_t right, char fill)
         return (PyObject *)self;
     }
 
-    u = PyString_FromStringAndSize(NULL,
-                                   left + PyString_GET_SIZE(self) + right);
+    u = PyString_FromStringAndSize(NULL, left + PyString_GET_SIZE(self) + right);
     if (u) {
         if (left)
             memset(PyString_AS_STRING(u), fill, left);
@@ -3186,6 +3701,92 @@ pad(PyStringObject *self, Py_ssize_t left, Py_ssize_t right, char fill)
     return u;
 }
 
+#define PAD_CENTER 0
+#define PAD_LJUST 1
+#define PAD_RJUST 2
+
+Py_LOCAL_INLINE(PyObject *)
+do_padding(PyStringObject *self, PyObject *args, int padtype)
+{
+    Py_ssize_t left, right, marg;
+    Py_ssize_t width;
+    PyObject *result = NULL;
+    PyTaintObject *taintobj = NULL;
+    PyObject* padding = NULL;
+    char fillchar = ' ';
+
+    if (!PyArg_ParseTuple(args, "n|O:ljust", &width, &padding))
+        return NULL;
+
+    if (padding != NULL) {
+        // string_ljust, string_rjust, string_center (ie. all methods using
+        // do_padding) originally accepted a char instead of object as their
+        // last argument (ie. the format string was "n|c"). The code below
+        // mimicks original error they raised when when a non-character
+        // argument was passed
+
+        if (!PyString_Check(padding))
+           return PyErr_Format(PyExc_TypeError,
+                               "must be char, not %s",
+                               Py_TYPE(padding)->tp_name);
+        if (PyString_GET_SIZE(padding) != 1)
+           return PyErr_Format(PyExc_TypeError, "must be char, not str");
+        fillchar = PyString_AS_STRING(padding)[0];
+        if (PyTaint_PropagationResult(&taintobj,
+                                      PyString_GET_MERITS(self),
+                                      PyString_GET_MERITS(padding)) == -1)
+            return NULL;
+    } else {
+        taintobj = PyString_GET_MERITS(self);
+    }
+
+
+    if (PyString_GET_SIZE(self) >= width && PyString_CheckExact(self)) {
+        if (PyString_GET_MERITS(self) == taintobj) {
+            Py_INCREF(self);
+            result = (PyObject*)self;
+            goto done;
+        }
+        result = PyString_FromStringAndSizeSameMerits(PyString_AS_STRING(self),
+                                                      PyString_GET_SIZE(self),
+                                                      taintobj);
+        // no error check because either way cleanup is the same; also
+        // in case of failure, result is NULL
+        goto done;
+    } else {
+        switch (padtype) {
+        case PAD_CENTER:
+            marg = width - PyString_GET_SIZE(self);
+            left = marg / 2 + (marg & width & 1);
+            right = marg - left;
+            break;
+        case PAD_LJUST:
+            left = 0;
+            right = width - PyString_GET_SIZE(self);
+            break;
+        case PAD_RJUST:
+            left = width - PyString_GET_SIZE(self);
+            right = 0;
+            break;
+        default:
+            Py_FatalError("Unknown padding type passed to do_padding");
+            return NULL;
+        }
+        result = pad(self, left, right, fillchar);
+        if (result == NULL)
+            goto done;
+
+        result = (PyObject*)PyString_AssignTaint((PyStringObject*)result,
+                                                 taintobj);
+    }
+
+  done:
+    if (padding != NULL)
+        Py_XDECREF(taintobj);
+    // when padding == NULL, taintobj is borrowed from self, so no decref
+    return result;
+}
+
 PyDoc_STRVAR(ljust__doc__,
 "S.ljust(width[, fillchar]) -> string\n"
 "\n"
@@ -3195,18 +3796,7 @@ PyDoc_STRVAR(ljust__doc__,
 static PyObject *
 string_ljust(PyStringObject *self, PyObject *args)
 {
-    Py_ssize_t width;
-    char fillchar = ' ';
-
-    if (!PyArg_ParseTuple(args, "n|c:ljust", &width, &fillchar))
-        return NULL;
-
-    if (PyString_GET_SIZE(self) >= width && PyString_CheckExact(self)) {
-        Py_INCREF(self);
-        return (PyObject*) self;
-    }
-
-    return pad(self, 0, width - PyString_GET_SIZE(self), fillchar);
+    return (PyObject*)do_padding(self, args, PAD_LJUST);
 }
 
 
@@ -3219,18 +3809,7 @@ PyDoc_STRVAR(rjust__doc__,
 static PyObject *
 string_rjust(PyStringObject *self, PyObject *args)
 {
-    Py_ssize_t width;
-    char fillchar = ' ';
-
-    if (!PyArg_ParseTuple(args, "n|c:rjust", &width, &fillchar))
-        return NULL;
-
-    if (PyString_GET_SIZE(self) >= width && PyString_CheckExact(self)) {
-        Py_INCREF(self);
-        return (PyObject*) self;
-    }
-
-    return pad(self, width - PyString_GET_SIZE(self), 0, fillchar);
+    return do_padding(self, args, PAD_RJUST);
 }
 
 
@@ -3243,22 +3822,7 @@ PyDoc_STRVAR(center__doc__,
 static PyObject *
 string_center(PyStringObject *self, PyObject *args)
 {
-    Py_ssize_t marg, left;
-    Py_ssize_t width;
-    char fillchar = ' ';
-
-    if (!PyArg_ParseTuple(args, "n|c:center", &width, &fillchar))
-        return NULL;
-
-    if (PyString_GET_SIZE(self) >= width && PyString_CheckExact(self)) {
-        Py_INCREF(self);
-        return (PyObject*) self;
-    }
-
-    marg = width - PyString_GET_SIZE(self);
-    left = marg / 2 + (marg & width & 1);
-
-    return pad(self, left, marg - left, fillchar);
+    return (PyObject*)do_padding(self, args, PAD_CENTER);
 }
 
 PyDoc_STRVAR(zfill__doc__,
@@ -3271,7 +3835,7 @@ static PyObject *
 string_zfill(PyStringObject *self, PyObject *args)
 {
     Py_ssize_t fill;
-    PyObject *s;
+    PyObject *s, *r;
     char *p;
     Py_ssize_t width;
 
@@ -3283,11 +3847,13 @@ string_zfill(PyStringObject *self, PyObject *args)
             Py_INCREF(self);
             return (PyObject*) self;
         }
-        else
-            return PyString_FromStringAndSize(
-            PyString_AS_STRING(self),
-            PyString_GET_SIZE(self)
-            );
+        s = PyString_FromStringAndSizeSameMerits(PyString_AS_STRING(self),
+                                                 PyString_GET_SIZE(self),
+                                                 PyString_GET_MERITS(self));
+
+        if (s == NULL)
+            return NULL;
+        return s;
     }
 
     fill = width - PyString_GET_SIZE(self);
@@ -3304,7 +3870,15 @@ string_zfill(PyStringObject *self, PyObject *args)
         p[fill] = '0';
     }
 
-    return (PyObject*) s;
+    if (PyString_CHECK_TAINTED(self)) {
+        r = PyString_FromStringAndSizeSameMerits(PyString_AS_STRING(s),
+                                                 PyString_GET_SIZE(s),
+                                                 PyString_GET_MERITS(self));
+        Py_DECREF(s);
+        return r;
+    } else {
+        return s;
+    }
 }
 
 PyDoc_STRVAR(isspace__doc__,
@@ -3559,14 +4133,26 @@ static PyObject*
 string_splitlines(PyStringObject *self, PyObject *args)
 {
     int keepends = 0;
+    PyObject *result;
 
     if (!PyArg_ParseTuple(args, "|i:splitlines", &keepends))
         return NULL;
 
-    return stringlib_splitlines(
+    result = stringlib_splitlines(
         (PyObject*) self, PyString_AS_STRING(self), PyString_GET_SIZE(self),
         keepends
     );
+
+    if (result == NULL)
+        return NULL;
+
+    if (_PyTaint_TaintStringListItems(result,
+                                PyString_GET_MERITS(self)) == -1) {
+        Py_DECREF(result);
+        return NULL;
+    }
+
+    return result;
 }
 
 PyDoc_STRVAR(sizeof__doc__,
@@ -3674,6 +4260,12 @@ string_methods[] = {
     {"center", (PyCFunction)string_center, METH_VARARGS, center__doc__},
     {"zfill", (PyCFunction)string_zfill, METH_VARARGS, zfill__doc__},
     {"format", (PyCFunction) do_string_format, METH_VARARGS | METH_KEYWORDS, format__doc__},
+    {"taint", (PyCFunction)string_taint, METH_NOARGS, taint__doc__},
+    {"isclean", (PyCFunction)string_isclean, METH_VARARGS, isclean__doc__},
+    {"istainted", (PyCFunction)string_istainted, METH_NOARGS, istainted__doc__},
+    {"_cleanfor", (PyCFunction)string_cleanfor, METH_O, cleanfor__doc__},
+    {"_merits", (PyCFunction)string_listmerits, METH_NOARGS, listmerits__doc__},
+    {"_propagate", (PyCFunction)string_propagate, METH_O, propagate__doc__},
     {"__format__", (PyCFunction) string__format__, METH_VARARGS, p_format__doc__},
     {"_formatter_field_name_split", (PyCFunction) formatter_field_name_split, METH_NOARGS},
     {"_formatter_parser", (PyCFunction) formatter_parser, METH_NOARGS},
@@ -4233,8 +4825,9 @@ PyString_Format(PyObject *format, PyObject *args)
     Py_ssize_t reslen, rescnt, fmtcnt;
     int args_owned = 0;
     PyObject *result, *orig_args;
+    PyTaintObject *taint;
 #ifdef Py_USING_UNICODE
-    PyObject *v, *w;
+    PyObject *v = NULL, *w;
 #endif
     PyObject *dict = NULL;
     if (format == NULL || !PyString_Check(format) || args == NULL) {
@@ -4246,6 +4839,9 @@ PyString_Format(PyObject *format, PyObject *args)
     fmtcnt = PyString_GET_SIZE(format);
     reslen = rescnt = fmtcnt + 100;
     result = PyString_FromStringAndSize((char *)NULL, reslen);
+    taint = PyString_GET_MERITS(format);
+    Py_XINCREF(taint);
+
     if (result == NULL)
         return NULL;
     res = PyString_AsString(result);
@@ -4473,6 +5069,10 @@ PyString_Format(PyObject *format, PyObject *args)
                     Py_DECREF(temp);
                     goto error;
                 }
+                if (PyTaint_PropagateTo(&taint, PyString_GET_MERITS(temp)) == -1) {
+                    Py_DECREF(temp);
+                    goto error;
+                }
                 pbuf = PyString_AS_STRING(temp);
                 len = PyString_GET_SIZE(temp);
                 if (prec >= 0 && len > prec)
@@ -4669,7 +5269,8 @@ PyString_Format(PyObject *format, PyObject *args)
     }
     if (_PyString_Resize(&result, reslen - rescnt))
         return NULL;
-    return result;
+
+    return PyString_AssignTaint((PyStringObject*)result, taint);
 
 #ifdef Py_USING_UNICODE
  unicode:
@@ -4709,9 +5310,18 @@ PyString_Format(PyObject *format, PyObject *args)
     Py_DECREF(format);
     if (v == NULL)
         goto error;
+    /* Assign taint to what we have so far, so that concat won't mess up
+       taint propagation. */
+    result = (PyObject*)PyString_AssignTaint((PyStringObject*)result,
+                                             taint);
+
+    if (result == NULL)
+        goto error;
     /* Paste what we have (result) to what the Unicode formatting
        function returned (v) and return the result (or error) */
     w = PyUnicode_Concat(result, v);
+
+    Py_XDECREF(taint);
     Py_DECREF(result);
     Py_DECREF(v);
     Py_DECREF(args);
@@ -4719,7 +5329,9 @@ PyString_Format(PyObject *format, PyObject *args)
 #endif /* Py_USING_UNICODE */
 
  error:
-    Py_DECREF(result);
+    Py_XDECREF(v);
+    Py_XDECREF(result);
+    Py_XDECREF(taint);
     if (args_owned) {
         Py_DECREF(args);
     }
@@ -4737,6 +5349,9 @@ PyString_InternInPlace(PyObject **p)
        it in the interned dict might do. */
     if (!PyString_CheckExact(s))
         return;
+    if (PyString_GET_MERITS(s) != NULL) {
+        Py_FatalError("PyString_InternInPlace: untainted strings only please!");
+    }
     if (PyString_CHECK_INTERNED(s))
         return;
     if (interned == NULL) {

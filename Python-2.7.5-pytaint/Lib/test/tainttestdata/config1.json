@@ -1,0 +1,32 @@
+{
+  "cleaners": [
+    {"merit": "MeritFull"},
+     "SimplePatcherTest.InnerClass.static_cleaner",
+     "SimplePatcherTest.InnerClass.instance_cleaner",
+     "SimplePatcherTest.InnerClass.class_cleaner",
+     "toplevel_cleaner",
+    {"merit": "MeritNone"},
+     "toplevel_cleaner",
+     "SimplePatcherTest.InnerClass.instance_cleaner"],
+  "sinks": [
+    {"merit": "MeritFull"},
+     "SimplePatcherTest.InnerClass.static_sink",
+     "SimplePatcherTest.InnerClass.class_sink",
+     "SimplePatcherTest.InnerClass.instance_sink",
+     "toplevel_sink",
+    {"SimplePatcherTest.InnerClass.complex_sink": {
+      "args": [
+         "self",
+        {"a": "MeritFull"},
+         "b",
+        {"c": ["MeritFull", "MeritNone"]}],
+       "kwargs": [
+          "e",
+         {"d": ["MeritNone", "MeritFull"]},
+         {"f": ["MeritNone", "MeritFull"]}]}}],
+  "sources": [
+    "SimplePatcherTest.InnerClass.static_source",
+    "SimplePatcherTest.InnerClass.instance_source",
+    "SimplePatcherTest.InnerClass.class_source",
+    "toplevel_source"]
+}

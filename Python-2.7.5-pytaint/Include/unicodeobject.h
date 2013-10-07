@@ -2,6 +2,7 @@
 #define Py_UNICODEOBJECT_H
 
 #include <stdarg.h>
+#include "taintobject.h"
 
 /*
 
@@ -406,6 +407,13 @@ typedef PY_UNICODE_TYPE Py_UNICODE;
     ((*((string)->str + (offset) + (substring)->length-1) == *((substring)->str + (substring)->length-1))) && \
      !memcmp((string)->str + (offset), (substring)->str, (substring)->length*sizeof(Py_UNICODE)))
 
+/* Assumes that x is not tainted */
+#define PyUnicode_ASSIGN_MERITS(x, t) \
+do {\
+  (((PyUnicodeObject*)x)->merits = t);\
+  Py_XINCREF(t);\
+} while(0);\
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -420,6 +428,7 @@ typedef struct {
     PyObject *defenc;           /* (Default) Encoded version as Python
                                    string, or NULL; this is used for
                                    implementing the buffer protocol */
+    PyTaintObject *merits;
 } PyUnicodeObject;
 
 PyAPI_DATA(PyTypeObject) PyUnicode_Type;
@@ -427,6 +436,9 @@ PyAPI_DATA(PyTypeObject) PyUnicode_Type;
 #define PyUnicode_Check(op) \
                  PyType_FastSubclass(Py_TYPE(op), Py_TPFLAGS_UNICODE_SUBCLASS)
 #define PyUnicode_CheckExact(op) (Py_TYPE(op) == &PyUnicode_Type)
+#define PyUnicode_CHECK_TAINTED(op) \
+    (((PyUnicodeObject *)(op))->merits != NULL)
+#define PyUnicode_IS_LATIN_CHAR(str) (str[0] < 256U)
 
 /* Fast access macros */
 #define PyUnicode_GET_SIZE(op) \
@@ -437,6 +449,15 @@ PyAPI_DATA(PyTypeObject) PyUnicode_Type;
     (((PyUnicodeObject *)(op))->str)
 #define PyUnicode_AS_DATA(op) \
     ((const char *)((PyUnicodeObject *)(op))->str)
+#define PyUnicode_GET_MERITS(op) \
+    (((PyUnicodeObject *)(op))->merits)
+
+#define PyUnicode_IS_SHARED(op) \
+    (((PyUnicodeObject*)op) == unicode_empty || \
+        (((PyUnicodeObject*)op)->length == 1 && \
+         PyUnicode_IS_LATIN_CHAR(((PyUnicodeObject*)op)->str) && \
+         unicode_latin1[((PyUnicodeObject*)op)->str[0]] == \
+            ((PyUnicodeObject*)op)))
 
 /* --- Constants ---------------------------------------------------------- */
 
@@ -465,6 +486,23 @@ PyAPI_FUNC(PyObject*) PyUnicode_FromUnicode(
     const Py_UNICODE *u,        /* Unicode buffer */
     Py_ssize_t size             /* size of buffer */
     );
+
+/* Similar to PyUnicode_FromUnicode, except it does not allow for sharing of
+   short strings. */
+PyAPI_FUNC(PyObject*) PyUnicode_FromUnicodeNoSharing(
+    const Py_UNICODE *u,        /* Unicode buffer */
+    Py_ssize_t size             /* size of buffer */
+    );
+
+/* Works the same as PyUnicode_FromUnicode when null merits are passed.
+   Otherwise it creates a non-shared string with given merits. The new object
+   owns a new reference to merits. */
+PyAPI_FUNC(PyObject*) PyUnicode_FromUnicodeSameMerits(
+    const Py_UNICODE *u,        /* Unicode buffer */
+    Py_ssize_t size,            /* size of buffer */
+    PyTaintObject *merits       /* taint value of new string */
+    );
+
 
 /* Similar to PyUnicode_FromUnicode(), but u points to Latin-1 encoded bytes */
 PyAPI_FUNC(PyObject*) PyUnicode_FromStringAndSize(
@@ -552,6 +590,24 @@ PyAPI_FUNC(PyObject*) PyUnicode_FromEncodedObject(
 PyAPI_FUNC(PyObject*) PyUnicode_FromObject(
     register PyObject *obj      /* Object */
     );
+
+/* Copy pointer to taint object from source to target. Target's original taint
+   object is decref'ed, and source's increfed (no new objects are created). */
+void _PyUnicode_CopyTaint(PyUnicodeObject *target,
+                          PyUnicodeObject *source);
+
+/* When passed a unicode object returns 1 when it is passed, 0 otherwise. If
+   passed object is not a unicode object, sets ValueError and returns -1. */
+int
+PyUnicode_IsShared(PyUnicodeObject *u);
+
+/* PyUnicode_AssigntTaint will return unicode object with same contents as u
+   and taint value taint. The return value may be either the same object as u
+   or a new unicodeobject.
+
+   Steals reference to u. Returns NULL on failure. */
+PyObject*
+PyUnicode_AssignTaint(PyUnicodeObject *u, PyTaintObject *taint);
 
 PyAPI_FUNC(PyObject *) PyUnicode_FromFormatV(const char*, va_list);
 PyAPI_FUNC(PyObject *) PyUnicode_FromFormat(const char*, ...);
@@ -1065,13 +1121,16 @@ PyAPI_FUNC(PyObject*) PyUnicode_EncodeCharmap(
    ordinals (ones which cause a LookupError) are left untouched and
    are copied as-is.
 
+   This function steals a reference to passed taintobject (either when
+   succesful or on failure).
 */
 
 PyAPI_FUNC(PyObject *) PyUnicode_TranslateCharmap(
     const Py_UNICODE *data,     /* Unicode char buffer */
     Py_ssize_t length,                  /* Number of Py_UNICODE chars to encode */
     PyObject *table,            /* Translate table */
-    const char *errors          /* error handling */
+    const char *errors,         /* error handling */
+    PyTaintObject *taint        /* taint object to propagate changes with */
     );
 
 #ifdef MS_WIN32
