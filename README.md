@@ -1,6 +1,6 @@
 pytaint
 =======
-The goal of pytaint project is providing a taint tracking mechanism for Python
+The goal of pytaint project is to provide a taint tracking mechanism for Python
 by modifying the CPython interpreter and adding a module with convenience
 functions. Taint tracking is a feature which allows to monitor the flow of
 untrusted data across the application and preventing from using it in sensitive
@@ -14,7 +14,7 @@ Build and test:
 
 Usage
 -----
-pytaint can be used manually or using a configuration.
+pytaint can be used manually or with a configuration.
 Let's look at manual usage first:
 
 ### Manual Usage
@@ -52,7 +52,7 @@ assert r.isclean(SQLiMerit) == False
 
 ### Configured Usage
 
-Alternatively you can also use pytaint with a configuration which is defined in
+Alternatively, you can also use pytaint with a configuration which is defined in
 JSON:
 
 ```json
@@ -96,14 +96,15 @@ c = 'host ' + s
 os.system(c)
 ```
 
-This program will work well because the user supplied input is sanitized.
+This program will terminate correctly because the user-supplied input is
+sanitized.
 However, if the call to `pipes.quote` is removed, it will throw a `TaintError`
 exception with an explaination that the string `s` is missing the `ShellMerit`.
 
 ### Verbose Example
 
 You can see a practical real world example in
-[example_practical.*][example_practica.py].
+[example_practical.py](example_practical.py).
 
 Authors
 -------
