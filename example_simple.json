@@ -1,0 +1,10 @@
+{
+  "cleaners": [
+    {"merit": "ShellMerit"},
+     "pipes.quote"],
+  "sinks": [
+    {"merit": "ShellMerit"},
+     "os.system"],
+  "sources": [
+    "raw_input"]
+}
