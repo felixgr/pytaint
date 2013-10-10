@@ -212,11 +212,11 @@ configuration with cleaners, sinks and sources should be used.
 
 ##### Comparison, interning and hashing
 
-Comparison (__eq__) ignores taint and merit information. There are some reasons
+Comparison (`__eq__`) ignores taint and merit information. There are some reasons
 why this may be a good idea:
 
 * less refactoring when adding taint to existing code
-* taint should be checked by sinks, not by using __eq__
+* taint should be checked by sinks, not by using `__eq__`
 * it won’t lead to confusing bugs where two strings that “print the same” are
   different
 
@@ -424,7 +424,7 @@ class, it will be wrapped in a Propagator proxy.
 
 Propagator proxy can be used to add taint propagation to an arbitrary class. If
 this is the case, the taint will be collected from the constructor’s argument on
-initialization, and assigned to __taint variable. All the methods will propagate
+initialization, and assigned to `__taint` variable. All the methods will propagate
 taint between this variable and their arguments and taint result accordingly
 (wrapping it with the same class).
 
