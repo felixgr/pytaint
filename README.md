@@ -6,6 +6,8 @@ functions. Taint tracking is a feature which allows to monitor the flow of
 untrusted data across the application and preventing from using it in sensitive
 parts without proper sanitization.
 
+[Chime in on the python-ideas mailing list discussion](https://mail.python.org/pipermail/python-ideas/2013-October/023624.html).
+
 Compiling & testing
 -------------------
 Build and test:
